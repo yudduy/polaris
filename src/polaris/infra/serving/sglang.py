@@ -35,6 +35,7 @@ class Generation:
     estimated_dollar_cost: float
     acceptance_ratio: float | None = None
     token_ids: list[int] | None = None
+    meta_info: dict[str, Any] | None = None
 
 
 class SGLangGenerator:
@@ -97,6 +98,120 @@ class SGLangGenerator:
             "SGLang MCMC generation is blocked until score_segments parity passes "
             "against the HF oracle. Use generate_low_temp/score_segments smokes first."
         )
+
+    def generate_sps_power(
+        self,
+        prompt_text: str,
+        *,
+        temperature: float,
+        max_new_tokens: int = MAX_NEW_TOKENS,
+        block_num: int = MCMC_BLOCK_NUM,
+        top_k: int = 8,
+        candidate_pool_size: int = 8,
+        rollouts_per_candidate: int = 8,
+        rollout_horizon: int | None = None,
+        seed_base: int | None = None,
+        seed_offset: int = 0,
+    ) -> Generation:
+        return self.generate_sps_power_batch(
+            [prompt_text],
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            block_num=block_num,
+            top_k=top_k,
+            candidate_pool_size=candidate_pool_size,
+            rollouts_per_candidate=rollouts_per_candidate,
+            rollout_horizon=rollout_horizon,
+            seed_base=seed_base,
+            seed_offsets=[seed_offset],
+        )[0]
+
+    def generate_sps_power_batch(
+        self,
+        prompt_texts: list[str],
+        *,
+        temperature: float,
+        max_new_tokens: int = MAX_NEW_TOKENS,
+        block_num: int = MCMC_BLOCK_NUM,
+        top_k: int = 8,
+        candidate_pool_size: int = 8,
+        rollouts_per_candidate: int = 8,
+        rollout_horizon: int | None = None,
+        seed_base: int | None = None,
+        seed_offsets: list[int] | None = None,
+    ) -> list[Generation]:
+        if not prompt_texts:
+            return []
+        if temperature <= 0.0:
+            raise ValueError(f"temperature must be > 0, got {temperature}")
+        if block_num <= 0:
+            raise ValueError(f"block_num must be > 0, got {block_num}")
+        if max_new_tokens < 0:
+            raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
+        if top_k <= 0:
+            raise ValueError(f"top_k must be > 0, got {top_k}")
+        if candidate_pool_size <= 0:
+            raise ValueError(
+                f"candidate_pool_size must be > 0, got {candidate_pool_size}"
+            )
+        if rollouts_per_candidate < 0:
+            raise ValueError(
+                f"rollouts_per_candidate must be >= 0, got {rollouts_per_candidate}"
+            )
+        if seed_offsets is None:
+            offsets = list(range(len(prompt_texts)))
+        else:
+            offsets = [int(x) for x in seed_offsets]
+            if len(offsets) != len(prompt_texts):
+                raise ValueError("seed_offsets length must match prompt_texts length")
+
+        alpha = 1.0 / float(temperature)
+        if alpha <= 1.0:
+            return [
+                self.generate_low_temp(
+                    prompt_text,
+                    temperature=1.0,
+                    max_new_tokens=max_new_tokens,
+                )
+                for prompt_text in prompt_texts
+            ]
+
+        base_seed = self.seed if seed_base is None else int(seed_base)
+        block_size = max(1, (max_new_tokens + block_num - 1) // block_num)
+        sampling_params = [
+            {
+                "max_new_tokens": max_new_tokens,
+                "power_sampling": {
+                    "alpha": alpha,
+                    "block_size": block_size,
+                    "candidate_pool_size": max(candidate_pool_size, top_k),
+                    "candidate_top_k": top_k,
+                    "rollouts_per_candidate": rollouts_per_candidate,
+                    "rollout_horizon": rollout_horizon,
+                    "jackknife": True,
+                    "seed": base_seed + offsets[i] * 1_000_003,
+                },
+            }
+            for i in range(len(prompt_texts))
+        ]
+        payload = {
+            "text": prompt_texts,
+            "sampling_params": sampling_params,
+            "stream": False,
+        }
+        started = time.monotonic()
+        response = self._transport("/generate", payload)
+        elapsed = time.monotonic() - started
+        rows = response if isinstance(response, list) else [response]
+        if len(rows) != len(prompt_texts):
+            raise RuntimeError(
+                f"SGLang SPS returned {len(rows)} rows for {len(prompt_texts)} prompts"
+            )
+        per_row_wall = elapsed / max(1, len(rows))
+        return [
+            _native_generation(row, prompt, per_row_wall)
+            for row, prompt in zip(rows, prompt_texts)
+        ]
 
     def score_segments(
         self,
@@ -272,3 +387,27 @@ def _completion_token_ids(response: dict[str, Any]) -> list[int]:
             return [int(x) for x in token_ids]
     token_ids = response.get("token_ids")
     return [int(x) for x in token_ids] if token_ids is not None else []
+
+
+def _native_generation(
+    response: dict[str, Any], prompt_text: str, wall_clock_seconds: float
+) -> Generation:
+    meta_info = dict(response.get("meta_info") or {})
+    prompt_tokens = int(meta_info.get("prompt_tokens", 0))
+    completion_tokens = int(meta_info.get("completion_tokens", 0))
+    token_ids = response.get("output_ids") or response.get("token_ids") or []
+    if not completion_tokens:
+        completion_tokens = len(token_ids)
+    cost = estimate_cost(prompt_tokens, completion_tokens)
+    return Generation(
+        generation=str(response.get("text") or ""),
+        prompt_text=prompt_text,
+        response_contains_prompt=False,
+        prompt_token_count=prompt_tokens,
+        generation_token_count=completion_tokens,
+        wall_clock_seconds=wall_clock_seconds,
+        estimated_dollar_cost=cost.dollars,
+        acceptance_ratio=None,
+        token_ids=[int(x) for x in token_ids],
+        meta_info=meta_info,
+    )

@@ -159,3 +159,70 @@ def test_sglang_power_generation_blocked_until_parity():
     gen = SGLangGenerator(model_id="m", transport=lambda endpoint, payload: {})
     with pytest.raises(NotImplementedError, match="parity"):
         gen.generate_power("Q", temperature=0.25, max_new_tokens=8)
+
+
+def test_sglang_generate_sps_power_batch_uses_native_generate():
+    calls = []
+
+    def transport(endpoint, payload):
+        calls.append((endpoint, payload))
+        return [
+            {
+                "text": "A",
+                "output_ids": [1, 2],
+                "meta_info": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "power_sampling": {"candidate_count": 4},
+                },
+            },
+            {
+                "text": "B",
+                "output_ids": [3, 4],
+                "meta_info": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "power_sampling": {"candidate_count": 4},
+                },
+            },
+        ]
+
+    gen = SGLangGenerator(model_id="m", seed=17, transport=transport)
+    outs = gen.generate_sps_power_batch(
+        ["Q1", "Q2"],
+        temperature=0.25,
+        max_new_tokens=4,
+        block_num=2,
+        top_k=2,
+        candidate_pool_size=2,
+        rollouts_per_candidate=1,
+        rollout_horizon=1,
+        seed_base=100,
+        seed_offsets=[0, 10],
+    )
+
+    assert calls[0][0] == "/generate"
+    payload = calls[0][1]
+    assert payload["text"] == ["Q1", "Q2"]
+    assert payload["stream"] is False
+    assert [p["max_new_tokens"] for p in payload["sampling_params"]] == [4, 4]
+    power = [p["power_sampling"] for p in payload["sampling_params"]]
+    assert [p["alpha"] for p in power] == [4.0, 4.0]
+    assert [p["block_size"] for p in power] == [2, 2]
+    assert [p["candidate_top_k"] for p in power] == [2, 2]
+    assert [p["rollouts_per_candidate"] for p in power] == [1, 1]
+    assert [p["seed"] for p in power] == [100, 100 + 10 * 1_000_003]
+    assert [out.generation for out in outs] == ["A", "B"]
+    assert [out.token_ids for out in outs] == [[1, 2], [3, 4]]
+    assert outs[0].meta_info["power_sampling"]["candidate_count"] == 4
+
+
+def test_sglang_generate_sps_power_batch_rejects_bad_seed_offsets():
+    gen = SGLangGenerator(model_id="m", transport=lambda endpoint, payload: {})
+    with pytest.raises(ValueError, match="seed_offsets"):
+        gen.generate_sps_power_batch(
+            ["Q1", "Q2"],
+            temperature=0.25,
+            max_new_tokens=4,
+            seed_offsets=[0],
+        )
