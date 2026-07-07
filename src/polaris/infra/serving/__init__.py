@@ -93,3 +93,18 @@ class BatchedSampler(Sampler, Protocol):
         seed_base: int | None = None,
         seed_offsets: list[int] | None = None,
     ) -> list[Any]: ...
+
+    def generate_sps_power_batch(
+        self,
+        prompt_texts: list[str],
+        *,
+        temperature: float,
+        max_new_tokens: int,
+        block_num: int = ...,
+        top_k: int = ...,
+        candidate_pool_size: int = ...,
+        rollouts_per_candidate: int = ...,
+        rollout_horizon: int | None = ...,
+        seed_base: int | None = None,
+        seed_offsets: list[int] | None = None,
+    ) -> list[Any]: ...

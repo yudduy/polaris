@@ -73,6 +73,12 @@ def compute_proicl_decomposition(accuracies: Mapping[str, float]) -> dict[str, A
 
     rf_denominator = prorl - base
     rf_valid = rf_denominator > 0.0
+    confound_delta = gepa_sps_fixed - sps
+    confound_status = (
+        "gepa_archive_sps_above_base_sps"
+        if confound_delta > 0.0
+        else "no_gepa_archive_sps_gain_over_base_sps"
+    )
     report = {
         "A_base": base,
         "A_bon": bon,
@@ -115,6 +121,13 @@ def compute_proicl_decomposition(accuracies: Mapping[str, float]) -> dict[str, A
         "discovery_gain": gepa - mcmc,
         "composition_gain": gepa_mcmc - max(mixed, gepa),
         "sps_composition_gain": gepa_sps_fixed - max(sps, gepa),
+        "confound_delta_gepa_archive_sps_vs_base_sps": confound_delta,
+        "confound_check_base_sps_vs_gepa_archive_sps": {
+            "base_sps_accuracy": sps,
+            "gepa_archive_sps_accuracy": gepa_sps_fixed,
+            "delta": confound_delta,
+            "status": confound_status,
+        },
     }
     if not rf_valid:
         report["analysis_warning"] = (
@@ -184,6 +197,9 @@ def write_proicl_decomposition(
         f"- discovery_gain: {report['discovery_gain']:.6f}",
         f"- composition_gain: {report['composition_gain']:.6f}",
         f"- sps_composition_gain: {report['sps_composition_gain']:.6f}",
+        f"- confound_delta_gepa_archive_sps_vs_base_sps: {report['confound_delta_gepa_archive_sps_vs_base_sps']:.6f}",
+        "- confound_status_base_sps_vs_gepa_archive_sps: "
+        f"{report['confound_check_base_sps_vs_gepa_archive_sps']['status']}",
     ]
     if report.get("analysis_warning"):
         lines.extend(["", f"- warning: {report['analysis_warning']}"])
@@ -271,6 +287,7 @@ def write_proicl_decomposition_by_track(
                 f"- RF_memory: {_fmt(report['RF_memory'])}",
                 f"- slow_weight_residual: {report['slow_weight_residual']:.6f}",
                 f"- sharpening_gain: {report['sharpening_gain']:.6f}",
+                f"- sps_gain: {report['sps_gain']:.6f}",
                 f"- mixed_alpha_gain: {report['mixed_alpha_gain']:.6f}",
                 f"- fork_gain: {report['fork_gain']:.6f}",
                 f"- prompt_archive_gain: {report['prompt_archive_gain']:.6f}",
@@ -279,6 +296,10 @@ def write_proicl_decomposition_by_track(
                 f"- memory_gain: {report['memory_gain']:.6f}",
                 f"- discovery_gain: {report['discovery_gain']:.6f}",
                 f"- composition_gain: {report['composition_gain']:.6f}",
+                f"- sps_composition_gain: {report['sps_composition_gain']:.6f}",
+                f"- confound_delta_gepa_archive_sps_vs_base_sps: {report['confound_delta_gepa_archive_sps_vs_base_sps']:.6f}",
+                "- confound_status_base_sps_vs_gepa_archive_sps: "
+                f"{report['confound_check_base_sps_vs_gepa_archive_sps']['status']}",
                 *(
                     [f"- warning: {report['analysis_warning']}"]
                     if report.get("analysis_warning")

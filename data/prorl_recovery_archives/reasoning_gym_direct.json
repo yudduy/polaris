@@ -1,8 +1,0 @@
-[
-  {
-    "descriptor_hint": "reasoning_gym_direct_answer_tag",
-    "id": "direct",
-    "prefix": "Solve the following task. Reason if needed, then put only the final answer inside <answer>...</answer>. For JSON tasks, the content inside the answer tag must be valid JSON and contain no prose.\n\nTask:\n",
-    "suffix": "\n\nReturn only the required final value inside <answer>...</answer>; do not put reasoning inside the answer tag."
-  }
-]

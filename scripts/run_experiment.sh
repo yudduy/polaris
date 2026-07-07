@@ -61,12 +61,20 @@ Environment knobs:
   VLLM_PARITY_ARTIFACT     Existing calibration_summary.json. If unset, calibration is run.
   SKIP_INSTALL=1           Reuse the current environment.
   INSTALL_PROFILE          standard or full. Default: standard.
-  CONSTRAINTS_FILE         pip constraints file. Default: constraints/proicl-eval.txt.
+  CONSTRAINTS_FILE         Optional pip constraints file. Default: unset.
   SKIP_BINARY_PREFLIGHT=1  Skip the Linux binary-wheel resolver preflight.
-  REFLECTION_PROVIDER      xai or local-hf. Default: local-hf.
+  REFLECTION_PROVIDER      local-hf. Default: local-hf.
   WANDB_PROJECT            W&B project when WANDB_API_KEY is set. Default: proicl.
   SKIP_CALIBRATION=1       Require VLLM_PARITY_ARTIFACT instead of running calibration.
-  SKIP_SPS_MATH500_CALIBRATION=0 Run the slow SPS-vs-MCMC MATH500 gate. Default: skipped.
+  SKIP_SPS_MATH500_CALIBRATION=1 Skip the SPS MATH500 sampled-baseline gate. Default: real runs gate, dry/smoke skips.
+  SPS_CALIBRATION_BASELINE_CONDITION MATH500 calibration baseline. Default: bon_temp1.
+  SPS_CALIBRATION_SAMPLES_PER_PROBLEM Matched calibration sample budget. Default: ROLLOUT_BUDGET.
+  SPS_REQUIRE_MCMC_APPROXIMATION=1 Also run the slow SPS-vs-MCMC approximation check. Default: 0.
+  SPS_MIN_SHARPENING_GAIN Minimum SPS-over-baseline MATH500 candidate-accuracy gain for the gate. Default: 0.01.
+  MATH_CALIB_MAX_NEW_TOKENS MATH500 calibration generation cap. Default: 4096.
+  MATH_CALIB_VLLM_MAX_MODEL_LEN MATH500 calibration context cap. Default: 6144.
+  SPS_MAX_CAPPED_FAILED_RATE Maximum cap-failed candidate rate for the MATH500 gate. Default: 0.01.
+  SPS_ALPHA                 Fixed SPS power alpha for calibration and held-out SPS cells. Default: 4.0.
   PYTHON                   Explicit Python 3.11/3.12 interpreter. Overrides VENV auto-detection.
   SMOKE_ONLY=1             Developer-only: run only the harness smoke.
   INCLUDE_CANDIDATES=1     Include candidates.jsonl in the final bundle.
@@ -210,9 +218,9 @@ DRY_RUN="${DRY_RUN:-0}"
 SKIP_INSTALL="${SKIP_INSTALL:-0}"
 INSTALL_PROFILE="${INSTALL_PROFILE:-standard}"
 SKIP_CALIBRATION="${SKIP_CALIBRATION:-0}"
-SKIP_SPS_MATH500_CALIBRATION="${SKIP_SPS_MATH500_CALIBRATION:-1}"
+SKIP_SPS_MATH500_CALIBRATION="${SKIP_SPS_MATH500_CALIBRATION:-}"
 SKIP_BACKEND_PREFLIGHT="${SKIP_BACKEND_PREFLIGHT:-1}"
-CONSTRAINTS_FILE="${CONSTRAINTS_FILE:-constraints/proicl-eval.txt}"
+CONSTRAINTS_FILE="${CONSTRAINTS_FILE:-}"
 SKIP_BINARY_PREFLIGHT="${SKIP_BINARY_PREFLIGHT:-0}"
 if [[ "${RUN_BACKEND_PREFLIGHT:-0}" == "1" ]]; then
   SKIP_BACKEND_PREFLIGHT=0
@@ -221,6 +229,13 @@ SMOKE_ONLY="${SMOKE_ONLY:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 INCLUDE_CANDIDATES="${INCLUDE_CANDIDATES:-0}"
 export PROICL_DISABLE_TQDM="${PROICL_DISABLE_TQDM:-1}"
+if [[ -z "$SKIP_SPS_MATH500_CALIBRATION" ]]; then
+  if [[ "$DRY_RUN" == "1" || "$SMOKE_ONLY" == "1" ]]; then
+    SKIP_SPS_MATH500_CALIBRATION=1
+  else
+    SKIP_SPS_MATH500_CALIBRATION=0
+  fi
+fi
 
 RUN_ROOT="${RUN_ROOT:-runs/experiment}"
 RUN_TAG="${RUN_TAG:-heldout}"
@@ -250,11 +265,22 @@ SPS_ROLLOUT_HORIZON="${SPS_ROLLOUT_HORIZON:-128}"
 RUN_KIND="${RUN_KIND:-local}"
 RUN_STAGE="${RUN_STAGE:-small_real_slice}"
 REFLECTION_PROVIDER="${REFLECTION_PROVIDER:-local-hf}"
+if [[ "$REFLECTION_PROVIDER" != "local-hf" ]]; then
+  echo "REFLECTION_PROVIDER=$REFLECTION_PROVIDER is no longer supported; use local-hf." >&2
+  exit 2
+fi
 REFLECTION_MODEL_ID="${REFLECTION_MODEL_ID:-Qwen/Qwen2.5-7B-Instruct}"
 MATH_CALIB_START="${MATH_CALIB_START:-0}"
-MATH_CALIB_END="${MATH_CALIB_END:-20}"
-MATH_CALIB_MAX_NEW_TOKENS="${MATH_CALIB_MAX_NEW_TOKENS:-3072}"
+MATH_CALIB_END="${MATH_CALIB_END:-100}"
+MATH_CALIB_MAX_NEW_TOKENS="${MATH_CALIB_MAX_NEW_TOKENS:-4096}"
+MATH_CALIB_VLLM_MAX_MODEL_LEN="${MATH_CALIB_VLLM_MAX_MODEL_LEN:-6144}"
+SPS_CALIBRATION_BASELINE_CONDITION="${SPS_CALIBRATION_BASELINE_CONDITION:-bon_temp1}"
+SPS_CALIBRATION_SAMPLES_PER_PROBLEM="${SPS_CALIBRATION_SAMPLES_PER_PROBLEM:-$ROLLOUT_BUDGET}"
 SPS_CALIBRATION_TOLERANCE="${SPS_CALIBRATION_TOLERANCE:-0.02}"
+SPS_MIN_SHARPENING_GAIN="${SPS_MIN_SHARPENING_GAIN:-0.01}"
+SPS_MAX_CAPPED_FAILED_RATE="${SPS_MAX_CAPPED_FAILED_RATE:-0.01}"
+SPS_REQUIRE_MCMC_APPROXIMATION="${SPS_REQUIRE_MCMC_APPROXIMATION:-0}"
+SPS_ALPHA="${SPS_ALPHA:-4.0}"
 
 VENV="${VENV:-.venv-eval}"
 VENV_PY="$REPO_ROOT/$VENV/bin/python"
@@ -1087,6 +1113,16 @@ payload = {
     "rollout_budget": int(os.environ["PROICL_ROLLOUT_BUDGET"]),
     "max_new_tokens": int(os.environ["PROICL_MAX_NEW_TOKENS"]),
     "sps": {
+        "math500_gate_skipped": os.environ["PROICL_SKIP_SPS_MATH500_CALIBRATION"] == "1",
+        "math500_gate_baseline_condition": os.environ["PROICL_SPS_CALIBRATION_BASELINE_CONDITION"],
+        "math500_gate_samples_per_problem": int(os.environ["PROICL_SPS_CALIBRATION_SAMPLES_PER_PROBLEM"]),
+        "math500_gate_max_new_tokens": int(os.environ["PROICL_MATH_CALIB_MAX_NEW_TOKENS"]),
+        "math500_gate_vllm_max_model_len": int(os.environ["PROICL_MATH_CALIB_VLLM_MAX_MODEL_LEN"]),
+        "require_mcmc_approximation": os.environ["PROICL_SPS_REQUIRE_MCMC_APPROXIMATION"] == "1",
+        "math500_gate_tolerance": float(os.environ["PROICL_SPS_CALIBRATION_TOLERANCE"]),
+        "min_sharpening_gain": float(os.environ["PROICL_SPS_MIN_SHARPENING_GAIN"]),
+        "max_capped_failed_rate": float(os.environ["PROICL_SPS_MAX_CAPPED_FAILED_RATE"]),
+        "alpha": float(os.environ["PROICL_SPS_ALPHA"]),
         "block_num": int(os.environ["PROICL_SPS_BLOCK_NUM"]),
         "top_k": int(os.environ["PROICL_SPS_TOP_K"]),
         "candidate_pool_size": int(os.environ["PROICL_SPS_CANDIDATE_POOL_SIZE"]),
@@ -1177,7 +1213,7 @@ print_launch_summary() {
   if [[ "$SKIP_BINARY_PREFLIGHT" == "1" ]]; then
     binary_preflight_enabled=0
   fi
-  echo "  install_profile=$INSTALL_PROFILE constraints_file=$CONSTRAINTS_FILE binary_preflight=$binary_preflight_enabled"
+  echo "  install_profile=$INSTALL_PROFILE constraints_file=${CONSTRAINTS_FILE:-none} binary_preflight=$binary_preflight_enabled"
   echo "  reflection_provider=$REFLECTION_PROVIDER"
   echo "  estimated_wall_clock_seconds_per_cell=$ESTIMATED_WALL_CLOCK_SECONDS_PER_CELL"
 }
@@ -1217,6 +1253,16 @@ export PROICL_GEPA_DEV_START="$GEPA_DEV_START"
 export PROICL_GEPA_DEV_END="$GEPA_DEV_END"
 export PROICL_ROLLOUT_BUDGET="$ROLLOUT_BUDGET"
 export PROICL_MAX_NEW_TOKENS="$MAX_NEW_TOKENS"
+export PROICL_SKIP_SPS_MATH500_CALIBRATION="$SKIP_SPS_MATH500_CALIBRATION"
+export PROICL_MATH_CALIB_MAX_NEW_TOKENS="$MATH_CALIB_MAX_NEW_TOKENS"
+export PROICL_MATH_CALIB_VLLM_MAX_MODEL_LEN="$MATH_CALIB_VLLM_MAX_MODEL_LEN"
+export PROICL_SPS_CALIBRATION_BASELINE_CONDITION="$SPS_CALIBRATION_BASELINE_CONDITION"
+export PROICL_SPS_CALIBRATION_SAMPLES_PER_PROBLEM="$SPS_CALIBRATION_SAMPLES_PER_PROBLEM"
+export PROICL_SPS_CALIBRATION_TOLERANCE="$SPS_CALIBRATION_TOLERANCE"
+export PROICL_SPS_MIN_SHARPENING_GAIN="$SPS_MIN_SHARPENING_GAIN"
+export PROICL_SPS_MAX_CAPPED_FAILED_RATE="$SPS_MAX_CAPPED_FAILED_RATE"
+export PROICL_SPS_REQUIRE_MCMC_APPROXIMATION="$SPS_REQUIRE_MCMC_APPROXIMATION"
+export PROICL_SPS_ALPHA="$SPS_ALPHA"
 export PROICL_SPS_BLOCK_NUM="$SPS_BLOCK_NUM"
 export PROICL_SPS_TOP_K="$SPS_TOP_K"
 export PROICL_SPS_CANDIDATE_POOL_SIZE="$SPS_CANDIDATE_POOL_SIZE"
@@ -1392,7 +1438,7 @@ payload = {
         "need_create_venv": os.environ.get("PROICL_NEED_CREATE_VENV") == "1",
         "install_profile": os.environ.get("PROICL_INSTALL_PROFILE"),
         "skip_install": os.environ.get("PROICL_SKIP_INSTALL") == "1",
-        "constraints_file": constraints_file,
+        "constraints_file": constraints_file or None,
         "constraints_exists": constraints_exists,
         "binary_preflight_enabled": os.environ.get("PROICL_SKIP_BINARY_PREFLIGHT") != "1",
         "binary_preflight_packages": [
@@ -1446,7 +1492,7 @@ print(
 print(
     "  install="
     f"profile={install.get('install_profile')} "
-    f"constraints={install.get('constraints_file')} "
+    f"constraints={install.get('constraints_file') or 'none'} "
     f"constraints_exists={install.get('constraints_exists')} "
     f"binary_preflight={install.get('binary_preflight_enabled')}"
 )
@@ -1834,12 +1880,9 @@ if [[ "$DRY_RUN" != "1" && "$SKIP_INSTALL" != "1" ]]; then
   case "$INSTALL_PROFILE" in
     standard|light)
       run_cmd "$PY" -m pip install "${PIP_CONSTRAINT_ARGS[@]}" -r requirements.txt
-      if [[ "$REFLECTION_PROVIDER" == "xai" ]]; then
-        run_cmd "$PY" -m pip install "${PIP_CONSTRAINT_ARGS[@]}" -e ".[gepa_reflection]"
-      fi
       ;;
     full)
-      run_cmd "$PY" -m pip install "${PIP_CONSTRAINT_ARGS[@]}" -e ".[code,dc,gepa_reflection]" "vllm==0.9.2"
+      run_cmd "$PY" -m pip install "${PIP_CONSTRAINT_ARGS[@]}" -e ".[code,dc]" "vllm==0.9.2"
       ;;
     *)
       echo "INSTALL_PROFILE must be standard or full; got $INSTALL_PROFILE" >&2
@@ -1848,16 +1891,9 @@ if [[ "$DRY_RUN" != "1" && "$SKIP_INSTALL" != "1" ]]; then
   esac
 fi
 
-if [[ "$DRY_RUN" != "1" && "$REFLECTION_PROVIDER" == "xai" ]]; then
-  if ! "$PY" -c "import litellm" >/dev/null 2>&1; then
-    echo "REFLECTION_PROVIDER=xai requires litellm. Run: $PY -m pip install -e '.[gepa_reflection]'" >&2
-    exit 1
-  fi
-fi
-
 if [[ "$DRY_RUN" != "1" ]]; then
   section "Initializing optional W&B tracking"
-  run_cmd "$PY" scripts/wandb_run.py start \
+  run_cmd "$PY" scripts/proicl/wandb_run.py start \
     --run-root "$RUN_ROOT" \
     --config "$RUN_ROOT/launch_config.json" \
     --resource-probe "$RUN_ROOT/resource_probe.json" \
@@ -1909,7 +1945,7 @@ fi
 
 if [[ -z "${VLLM_PARITY_ARTIFACT:-}" && ( "$DRY_RUN" == "1" || ! -f "$CALIB_ARTIFACT" ) ]]; then
   section "Running vLLM/HF calibration"
-  CALIB_CMD=("$PY" scripts/vllm_hf_calibration.py \
+  CALIB_CMD=("$PY" scripts/preflight/vllm_hf_calibration.py \
     --model-key deepseek-r1-distill-qwen-1.5b \
     --out "$CALIB_DIR" \
     --temperature 0.25 \
@@ -1942,23 +1978,36 @@ if [[ "$DRY_RUN" != "1" ]]; then
   fi
 fi
 
-SPS_CALIB_DIR="$RUN_ROOT/calibration/sps_vs_mcmc_math500"
+SPS_CALIB_DIR="$RUN_ROOT/calibration/sps_math500_${SPS_CALIBRATION_BASELINE_CONDITION}_k${SPS_CALIBRATION_SAMPLES_PER_PROBLEM}"
 if [[ "$SKIP_SPS_MATH500_CALIBRATION" != "1" && "$SMOKE_ONLY" != "1" ]]; then
-  section "Running SPS-vs-MCMC calibration"
-  run_cmd "$PY" scripts/calibrate_sps.py \
+  section "Running SPS MATH500 sampled-baseline gate"
+  SPS_CALIB_CMD=(
+    "$PY" scripts/preflight/calibrate_sps.py
     --out "$SPS_CALIB_DIR" \
     --model-key deepseek-r1-distill-qwen-1.5b \
     --split "$MATH_CALIB_START" "$MATH_CALIB_END" \
+    --baseline-condition "$SPS_CALIBRATION_BASELINE_CONDITION" \
+    --samples-per-problem "$SPS_CALIBRATION_SAMPLES_PER_PROBLEM" \
+    --sps-alpha "$SPS_ALPHA" \
     --max-new-tokens "$MATH_CALIB_MAX_NEW_TOKENS" \
     --sps-block-size "$SPS_BLOCK_SIZE" \
     --sps-top-k "$SPS_TOP_K" \
     --sps-candidate-pool-size "$SPS_CANDIDATE_POOL_SIZE" \
     --sps-rollouts-per-candidate "$SPS_ROLLOUTS_PER_CANDIDATE" \
     --sps-rollout-horizon "$SPS_ROLLOUT_HORIZON" \
+    --vllm-max-model-len "$MATH_CALIB_VLLM_MAX_MODEL_LEN" \
     --vllm-parity-artifact "$CALIB_ARTIFACT" \
+    --run-kind "$RUN_KIND" \
     --estimated-wall-clock-seconds-per-cell "$ESTIMATED_WALL_CLOCK_SECONDS_PER_CELL" \
-    --tolerance "$SPS_CALIBRATION_TOLERANCE"
-  run_cmd "$PY" scripts/check_sps_calibration.py "$SPS_CALIB_DIR" \
+    --tolerance "$SPS_CALIBRATION_TOLERANCE" \
+    --min-sharpening-gain "$SPS_MIN_SHARPENING_GAIN" \
+    --max-capped-failed-rate "$SPS_MAX_CAPPED_FAILED_RATE"
+  )
+  if [[ "$SPS_REQUIRE_MCMC_APPROXIMATION" != "1" ]]; then
+    SPS_CALIB_CMD+=(--skip-mcmc-approximation)
+  fi
+  run_cmd "${SPS_CALIB_CMD[@]}"
+  run_cmd "$PY" scripts/preflight/check_sps_calibration.py "$SPS_CALIB_DIR" \
     --tolerance "$SPS_CALIBRATION_TOLERANCE"
 fi
 
@@ -1967,7 +2016,7 @@ RUNTIME_PROFILE_PATH="$RUN_ROOT/runtime_profile.json"
 if [[ "$DRY_RUN" != "1" && "$SKIP_BACKEND_PREFLIGHT" != "1" ]]; then
   section "Running production-shaped SPS/vLLM backend preflight"
   BACKEND_PREFLIGHT_CMD=(
-    "$PY" scripts/backend_preflight.py
+    "$PY" scripts/preflight/backend_preflight.py
     --out-dir "$BACKEND_PREFLIGHT_DIR"
     --runtime-profile "$RUNTIME_PROFILE_PATH"
     --track reasoning_gym_boxnet
@@ -2052,7 +2101,7 @@ read -r -a HELDOUT_ARGS <<<"$ARCHIVE_HELDOUT_TRACKS"
 read -r -a CONDITION_ARGS <<<"$CONDITIONS"
 
 MAIN_CMD=(
-  "$PY" scripts/run_proicl_signal.py
+  "$PY" scripts/proicl/run_proicl_signal.py
   --backend vllm
   --power-sampler sps
   --vllm-parity-artifact "$CALIB_ARTIFACT"
@@ -2072,6 +2121,7 @@ MAIN_CMD=(
   --archive-size "$ARCHIVE_SIZE"
   --max-metric-calls "$MAX_METRIC_CALLS"
   --max-new-tokens "$MAX_NEW_TOKENS"
+  --fixed-alpha "$SPS_ALPHA"
   --sps-block-num "$SPS_BLOCK_NUM"
   --sps-top-k "$SPS_TOP_K"
   --sps-candidate-pool-size "$SPS_CANDIDATE_POOL_SIZE"
@@ -2139,18 +2189,21 @@ cp "$RUN_ROOT/resource_probe.json" "$RUN_DIR/resource_probe.json"
 if [[ -f "$RUN_ROOT/wandb.json" ]]; then
   cp "$RUN_ROOT/wandb.json" "$RUN_DIR/wandb.json"
 fi
-
+if [[ -d "$RUN_ROOT/calibration" ]]; then
+  rm -rf "$RUN_DIR/calibration"
+  cp -R "$RUN_ROOT/calibration" "$RUN_DIR/calibration"
+fi
 PACKAGE_ROOT="$RUN_DIR"
 if [[ "$SMOKE_ONLY" == "1" ]]; then
   PACKAGE_ROOT="$RUN_DIR/smoke"
 else
-  run_cmd "$PY" scripts/audit_proicl_artifacts.py \
+  run_cmd "$PY" scripts/proicl/audit_proicl_artifacts.py \
     --plan "$RUN_DIR/full/proicl_signal_plan.json" \
     --out-dir "$RUN_DIR/full/artifact_audit" \
     --require-passed
 fi
 
-PACKAGE_CMD=("$PY" scripts/package_results.py --run-root "$PACKAGE_ROOT")
+PACKAGE_CMD=("$PY" scripts/proicl/package_results.py --run-root "$PACKAGE_ROOT")
 if [[ "$INCLUDE_CANDIDATES" == "1" ]]; then
   PACKAGE_CMD+=(--include-candidates)
 fi
@@ -2161,7 +2214,7 @@ echo "Run directory: $RUN_DIR"
 BUNDLE_PATH="$PACKAGE_ROOT/results_bundle.tar.gz"
 BUNDLE_ABS="$(cd "$(dirname "$BUNDLE_PATH")" && pwd)/$(basename "$BUNDLE_PATH")"
 if [[ -f "$RUN_DIR/wandb.json" ]]; then
-  run_cmd "$PY" scripts/wandb_run.py finish \
+  run_cmd "$PY" scripts/proicl/wandb_run.py finish \
     --run-root "$RUN_DIR" \
     --bundle "$BUNDLE_ABS" \
     --summary "$RUN_DIR/full/analysis/aggregate_stdout.json" \

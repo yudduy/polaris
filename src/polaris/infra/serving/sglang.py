@@ -35,10 +35,11 @@ class Generation:
     estimated_dollar_cost: float
     acceptance_ratio: float | None = None
     token_ids: list[int] | None = None
+    power_sampling: dict[str, Any] | None = None
 
 
 class SGLangGenerator:
-    """SGLang OpenAI-compatible client for R5 cheap validation.
+    """SGLang native `/generate` client for R5 cheap validation.
 
     MCMC production use is gated by `score_segments` parity against HF. This
     client intentionally talks to an already-running SGLang server so Modal and
@@ -51,7 +52,7 @@ class SGLangGenerator:
         base_url: str = "http://localhost:30000",
         seed: int = SEED,
         request_timeout: float = 600.0,
-        transport: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+        transport: Callable[[str, dict[str, Any]], Any] | None = None,
     ) -> None:
         self.model_id = model_id
         self.base_url = base_url.rstrip("/")
@@ -59,17 +60,26 @@ class SGLangGenerator:
         self.request_timeout = request_timeout
         self._transport = transport or self._post_json
 
+    def runtime_metadata(self) -> dict[str, Any]:
+        return {
+            "backend": "sglang",
+            "model_id": self.model_id,
+            "base_url": self.base_url,
+            "generation_endpoint": "/generate",
+            "scoring_endpoint": "/generate",
+        }
+
     def generate_greedy(
         self,
         prompt_text: str,
         *,
         max_new_tokens: int = MAX_NEW_TOKENS,
     ) -> Generation:
-        return self._completion(
-            prompt_text=prompt_text,
+        return self.generate_low_temp_batch(
+            [prompt_text],
             temperature=0.0,
             max_new_tokens=max_new_tokens,
-        )
+        )[0]
 
     def generate_low_temp(
         self,
@@ -78,11 +88,37 @@ class SGLangGenerator:
         temperature: float,
         max_new_tokens: int = MAX_NEW_TOKENS,
     ) -> Generation:
-        return self._completion(
-            prompt_text=prompt_text,
+        return self.generate_low_temp_batch(
+            [prompt_text],
             temperature=temperature,
             max_new_tokens=max_new_tokens,
-        )
+        )[0]
+
+    def generate_low_temp_batch(
+        self,
+        prompt_texts: list[str],
+        *,
+        temperature: float,
+        max_new_tokens: int = MAX_NEW_TOKENS,
+        seed_base: int | None = None,
+        seed_offsets: list[int] | None = None,
+        top_p: float | None = None,
+    ) -> list[Generation]:
+        if not prompt_texts:
+            return []
+        offsets = self._seed_offsets(prompt_texts, seed_offsets)
+        base_seed = self.seed if seed_base is None else int(seed_base)
+        sampling_params = []
+        for offset in offsets:
+            params: dict[str, Any] = {
+                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,
+                "sampling_seed": base_seed + int(offset),
+            }
+            if top_p is not None:
+                params["top_p"] = top_p
+            sampling_params.append(params)
+        return self._generate_native_batch(prompt_texts, sampling_params)
 
     def generate_power(
         self,
@@ -97,6 +133,68 @@ class SGLangGenerator:
             "SGLang MCMC generation is blocked until score_segments parity passes "
             "against the HF oracle. Use generate_low_temp/score_segments smokes first."
         )
+
+    def generate_power_batch(
+        self,
+        prompt_texts: list[str],
+        *,
+        temperature: float,
+        max_new_tokens: int = MAX_NEW_TOKENS,
+        mcmc_steps: int = MCMC_STEPS,
+        block_num: int = MCMC_BLOCK_NUM,
+        seed_base: int | None = None,
+        seed_offsets: list[int] | None = None,
+    ) -> list[Generation]:
+        raise NotImplementedError(
+            "SGLang MCMC generation is blocked until score_segments parity passes "
+            "against the HF oracle. Use generate_sps_power_batch for native SPS."
+        )
+
+    def generate_sps_power_batch(
+        self,
+        prompt_texts: list[str],
+        *,
+        temperature: float,
+        max_new_tokens: int = MAX_NEW_TOKENS,
+        block_num: int = MCMC_BLOCK_NUM,
+        top_k: int = 8,
+        candidate_pool_size: int = 8,
+        rollouts_per_candidate: int = 8,
+        rollout_horizon: int | None = None,
+        seed_base: int | None = None,
+        seed_offsets: list[int] | None = None,
+    ) -> list[Generation]:
+        if not prompt_texts:
+            return []
+        alpha = 1.0 / float(temperature)
+        if alpha <= 1.0:
+            return self.generate_low_temp_batch(
+                prompt_texts,
+                temperature=1.0,
+                max_new_tokens=max_new_tokens,
+                seed_base=seed_base,
+                seed_offsets=seed_offsets,
+            )
+        offsets = self._seed_offsets(prompt_texts, seed_offsets)
+        base_seed = self.seed if seed_base is None else int(seed_base)
+        sampling_params = []
+        for offset in offsets:
+            sampling_params.append(
+                {
+                    "max_new_tokens": max_new_tokens,
+                    "power_sampling": {
+                        "alpha": alpha,
+                        "block_size": block_num,
+                        "candidate_pool_size": candidate_pool_size,
+                        "candidate_top_k": top_k,
+                        "rollouts_per_candidate": rollouts_per_candidate,
+                        "rollout_horizon": rollout_horizon,
+                        "jackknife": True,
+                        "seed": base_seed + int(offset),
+                    },
+                }
+            )
+        return self._generate_native_batch(prompt_texts, sampling_params)
 
     def score_segments(
         self,
@@ -209,42 +307,56 @@ class SGLangGenerator:
             [float(r["lp_unnorm"]) for r in records],
         )
 
-    def _completion(
+    def _generate_native_batch(
         self,
-        *,
-        prompt_text: str,
-        temperature: float,
-        max_new_tokens: int,
-    ) -> Generation:
-        payload = {
-            "model": self.model_id,
-            "prompt": prompt_text,
-            "max_tokens": max_new_tokens,
-            "temperature": temperature,
-            "stream": False,
-            "seed": self.seed,
-        }
+        prompt_texts: list[str],
+        sampling_params: list[dict[str, Any]],
+    ) -> list[Generation]:
+        if len(prompt_texts) != len(sampling_params):
+            raise ValueError("prompt_texts and sampling_params length mismatch")
         started = time.monotonic()
-        response = self._transport("/v1/completions", payload)
-        elapsed = time.monotonic() - started
-        text = _completion_text(response)
-        usage = response.get("usage", {})
-        prompt_tokens = int(usage.get("prompt_tokens", 0))
-        completion_tokens = int(usage.get("completion_tokens", 0))
-        cost = estimate_cost(prompt_tokens, completion_tokens)
-        return Generation(
-            generation=text,
-            prompt_text=prompt_text,
-            response_contains_prompt=False,
-            prompt_token_count=prompt_tokens,
-            generation_token_count=completion_tokens,
-            wall_clock_seconds=elapsed,
-            estimated_dollar_cost=cost.dollars,
-            acceptance_ratio=None,
-            token_ids=_completion_token_ids(response),
+        response = self._transport(
+            "/generate",
+            {
+                "text": prompt_texts if len(prompt_texts) > 1 else prompt_texts[0],
+                "sampling_params": sampling_params
+                if len(sampling_params) > 1
+                else sampling_params[0],
+                "stream": False,
+            },
         )
+        elapsed = time.monotonic() - started
+        rows = response if isinstance(response, list) else [response]
+        if len(rows) != len(prompt_texts):
+            raise RuntimeError(
+                f"SGLang returned {len(rows)} generations for {len(prompt_texts)} prompts"
+            )
+        per_candidate_wall = elapsed / max(1, len(rows))
+        generations: list[Generation] = []
+        for prompt_text, row in zip(prompt_texts, rows):
+            meta = dict(row.get("meta_info", {}) or {})
+            prompt_tokens = int(meta.get("prompt_tokens", 0))
+            completion_tokens = int(
+                meta.get("completion_tokens", len(row.get("output_ids") or []))
+            )
+            cost = estimate_cost(prompt_tokens, completion_tokens)
+            generations.append(
+                Generation(
+                    generation=str(row.get("text") or ""),
+                    prompt_text=prompt_text,
+                    response_contains_prompt=False,
+                    prompt_token_count=prompt_tokens,
+                    generation_token_count=completion_tokens,
+                    wall_clock_seconds=float(meta.get("e2e_latency", per_candidate_wall)),
+                    estimated_dollar_cost=cost.dollars,
+                    acceptance_ratio=None,
+                    token_ids=[int(x) for x in row.get("output_ids") or []],
+                    power_sampling=meta.get("power_sampling"),
+                )
+            )
+        return generations
 
-    def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_json(self, endpoint: str, payload: dict[str, Any]) -> Any:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self.base_url + endpoint,
@@ -255,20 +367,14 @@ class SGLangGenerator:
         with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-
-def _completion_text(response: dict[str, Any]) -> str:
-    choices = response.get("choices") or []
-    if choices:
-        first = choices[0]
-        return str(first.get("text") or first.get("message", {}).get("content") or "")
-    return str(response.get("text") or "")
-
-
-def _completion_token_ids(response: dict[str, Any]) -> list[int]:
-    choices = response.get("choices") or []
-    if choices:
-        token_ids = choices[0].get("token_ids")
-        if token_ids is not None:
-            return [int(x) for x in token_ids]
-    token_ids = response.get("token_ids")
-    return [int(x) for x in token_ids] if token_ids is not None else []
+    def _seed_offsets(
+        self,
+        prompt_texts: list[str],
+        seed_offsets: list[int] | None,
+    ) -> list[int]:
+        if seed_offsets is None:
+            return list(range(len(prompt_texts)))
+        offsets = [int(x) for x in seed_offsets]
+        if len(offsets) != len(prompt_texts):
+            raise ValueError("seed_offsets length must match prompt_texts length")
+        return offsets

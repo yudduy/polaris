@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import ast
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -108,76 +106,9 @@ def test_paid_run_preflight_rejects_invalid_split(tmp_path):
         validate_paid_run_preflight(spec)
 
 
-def test_run_math500_cli_blocks_without_paid_preflight(tmp_path):
-    env = dict(os.environ)
-    env["PYTHONPATH"] = "src"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/run_math500.py",
-            "--condition",
-            "greedy",
-            "--archive",
-            str(tmp_path / "missing.json"),
-            "--out",
-            str(tmp_path / "run"),
-            "--polaris-source-hash",
-            "dev",
-            "--preregistration-anchor",
-            "TODO.md#test",
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert result.returncode != 0
-    assert "paid-run preflight failed" in result.stderr
-    assert "user_authorized must be true" in result.stderr
-
-
-def test_run_math500_cli_can_validate_preflight_without_loading_backend(tmp_path):
-    env = dict(os.environ)
-    env["PYTHONPATH"] = "src"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/run_math500.py",
-            "--condition",
-            "greedy",
-            "--archive",
-            str(tmp_path / "missing.json"),
-            "--out",
-            str(tmp_path / "run"),
-            "--polaris-source-hash",
-            "dev",
-            "--preregistration-anchor",
-            "TODO.md#test",
-            "--trajectory-cache",
-            str(tmp_path / "trajectories.sqlite"),
-            "--estimated-dollar-cost",
-            "0.10",
-            "--cost-cap-dollars",
-            "0.20",
-            "--user-authorized-paid-run",
-            "--preflight-only",
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert '"passed": true' in result.stdout
-
-
 def test_modal_gpu_entrypoints_require_preflight():
     root = Path(__file__).resolve().parents[2]
-    for rel in ("scripts/modal_app.py", "scripts/modal_vllm_app.py"):
+    for rel in ("scripts/modal/modal_vllm_app.py",):
         path = root / rel
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -203,7 +134,7 @@ def test_backend_preflight_classifies_vllm_runtime_failures():
     root = Path(__file__).resolve().parents[2]
     spec = importlib.util.spec_from_file_location(
         "backend_preflight",
-        root / "scripts" / "backend_preflight.py",
+        root / "scripts" / "preflight" / "backend_preflight.py",
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)

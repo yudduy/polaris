@@ -1,8 +1,0 @@
-[
-  {
-    "descriptor_hint": "direct_computation",
-    "id": "direct",
-    "prefix": "Solve this math problem. ",
-    "suffix": " Show the key calculation and put your final answer within \\boxed{}."
-  }
-]

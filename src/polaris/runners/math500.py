@@ -201,10 +201,12 @@ def _greedy_candidate(
     )
 
 
-def _supports_batch_generation(sampler: _SamplerLike) -> bool:
-    return callable(getattr(sampler, "generate_low_temp_batch", None)) and callable(
-        getattr(sampler, "generate_power_batch", None)
-    )
+def _supports_batch_generation(sampler: _SamplerLike, *, power_sampler: str) -> bool:
+    if not callable(getattr(sampler, "generate_low_temp_batch", None)):
+        return False
+    if power_sampler == "sps":
+        return callable(getattr(sampler, "generate_sps_power_batch", None))
+    return callable(getattr(sampler, "generate_power_batch", None))
 
 
 def _list_attr(obj: Any, name: str) -> list:
@@ -786,6 +788,7 @@ def run_condition(
     mcmc_steps: int = MCMC_STEPS,
     mcmc_block_num: int = MCMC_BLOCK_NUM,
     power_sampler: str = "mcmc",
+    fixed_alpha: float | None = None,
     sps_top_k: int = 8,
     sps_candidate_pool_size: int = 8,
     sps_rollouts_per_candidate: int = 8,
@@ -805,6 +808,8 @@ def run_condition(
         raise ValueError("mcmc_block_num must be positive")
     if power_sampler not in {"mcmc", "sps"}:
         raise ValueError("power_sampler must be one of {'mcmc', 'sps'}")
+    if fixed_alpha is not None and fixed_alpha <= 0.0:
+        raise ValueError("fixed_alpha must be positive when set")
     if sps_top_k <= 0:
         raise ValueError("sps_top_k must be positive")
     if sps_candidate_pool_size <= 0:
@@ -832,7 +837,11 @@ def run_condition(
         archive_subset = _archive_with_memory(archive_subset)
     if track == "gpqa_diamond":
         admit_memory = False
-    schedule = _select_schedule(condition)
+    schedule = (
+        AlphaSchedule(policy_id=f"fixed_alpha_{fixed_alpha:g}", alphas=(fixed_alpha,))
+        if fixed_alpha is not None
+        else _select_schedule(condition)
+    )
     B = int(budget_override or _budget_for(condition))
 
     candidates_path = out_dir / "candidates.jsonl"
@@ -944,7 +953,10 @@ def run_condition(
             )
             candidates: list[Candidate] = [best]
         else:
-            if _supports_batch_generation(sampler) and not memory_is_enabled:
+            if (
+                _supports_batch_generation(sampler, power_sampler=power_sampler)
+                and not memory_is_enabled
+            ):
                 best, candidates = _run_problem_batched(
                     archive_subset=archive_subset,
                     schedule=schedule,

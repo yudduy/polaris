@@ -1,8 +1,4 @@
-"""Isolated Modal app for vLLM scorer and MCMC smokes.
-
-Keep this separate from scripts/modal_app.py so normal HF/SGLang smokes do not
-build the large vLLM image.
-"""
+"""Isolated Modal app for vLLM scorer and MCMC checks."""
 
 from __future__ import annotations
 
@@ -10,7 +6,7 @@ from pathlib import Path
 
 import modal
 
-PROICL_ROOT = Path(__file__).resolve().parent.parent
+PROICL_ROOT = Path(__file__).resolve().parents[2]
 
 _IGNORE = [
     ".venv*",
@@ -47,6 +43,7 @@ vllm_image = (
 
 app = modal.App("proicl-vllm-smokes", image=vllm_image)
 hf_cache = modal.Volume.from_name("proicl-hf-cache", create_if_missing=True)
+runs_vol = modal.Volume.from_name("proicl-runs", create_if_missing=True)
 
 
 def _setup_paths() -> None:
@@ -723,7 +720,7 @@ from pathlib import Path
 out = Path("/tmp/proicl-vllm-calibration-{gate}")
 cmd = [
     "python",
-    "/proicl/scripts/vllm_hf_calibration.py",
+    "/proicl/scripts/preflight/vllm_hf_calibration.py",
     "--model-id",
     {MODEL_ID!r},
     "--out",
@@ -888,7 +885,7 @@ root = Path("/tmp/proicl-one-problem-vllm")
 subprocess.run(
     [
         "python",
-        "/proicl/scripts/run_proicl.py",
+        "/proicl/scripts/proicl/run_proicl.py",
         "write-direct-archives",
         "--root",
         str(root),
@@ -902,7 +899,7 @@ calibration = root / "calibration"
 subprocess.run(
     [
         "python",
-        "/proicl/scripts/vllm_hf_calibration.py",
+        "/proicl/scripts/preflight/vllm_hf_calibration.py",
         "--model-id",
         {model_id!r},
         "--model-revision",
@@ -1065,7 +1062,7 @@ calibration = root / "calibration"
 subprocess.run(
     [
         "python",
-        "/proicl/scripts/vllm_hf_calibration.py",
+        "/proicl/scripts/preflight/vllm_hf_calibration.py",
         "--model-id",
         {model_id!r},
         "--model-revision",
@@ -1659,3 +1656,213 @@ def smoke_run_experiment_script_h100(
         cost_cap_dollars=cost_cap_dollars,
         user_authorized_paid_run=user_authorized_paid_run,
     )
+
+
+@app.function(
+    gpu="H100:4",
+    timeout=60 * 60 * 24,
+    volumes={"/cache/huggingface": hf_cache, "/proicl-runs": runs_vol},
+)
+def run_heldout_goal_h100x4(
+    run_root: str = "/proicl-runs/heldout",
+    run_tag: str = "modal-goal",
+    max_new_tokens: int = 1024,
+    math_calib_end: int = 100,
+    math_calib_max_new_tokens: int = 4096,
+    math_calib_vllm_max_model_len: int = 6144,
+    sps_calibration_samples_per_problem: int = 8,
+    vllm_max_model_len: int = 4096,
+    rollout_budget: int = 8,
+    archive_size: int = 8,
+    max_metric_calls: int = 1500,
+    num_shards: int = 4,
+    max_parallel_cells: int = 4,
+    sps_alpha: float = 4.0,
+    sps_top_k: int = 8,
+    sps_candidate_pool_size: int = 8,
+    sps_rollouts_per_candidate: int = 8,
+    sps_rollout_horizon: int = 128,
+    sps_min_sharpening_gain: float = 0.01,
+    sps_max_capped_failed_rate: float = 0.01,
+    run_backend_preflight: bool = True,
+    estimated_dollar_cost: float | None = None,
+    cost_cap_dollars: float | None = None,
+    user_authorized_paid_run: bool = False,
+) -> dict:
+    """Run the paper-aligned held-out RF goal on one 4-GPU Modal H100 node."""
+    _setup_paths()
+    from polaris.registry import resolve_model
+
+    base_model = resolve_model("deepseek-r1-distill-qwen-1.5b")
+    prorl_model = resolve_model("nemotron-prorl-v2")
+    _require_modal_preflight(
+        backend="vllm",
+        estimated_dollar_cost=estimated_dollar_cost,
+        cost_cap_dollars=cost_cap_dollars,
+        user_authorized_paid_run=user_authorized_paid_run,
+        artifact_dir=run_root,
+        model_id=base_model.hf_id,
+    )
+    _ensure_model_cached(base_model.hf_id, revision=base_model.revision)
+    _ensure_model_cached(prorl_model.hf_id, revision=prorl_model.revision)
+
+    sps_calibration_dirname = (
+        f"sps_math500_bon_temp1_k{int(sps_calibration_samples_per_problem)}"
+    )
+    env_overrides = {
+        "PYTHON": "python",
+        "PYTHONPATH": "/proicl/src",
+        "RUN_ROOT": run_root,
+        "RUN_TAG": run_tag,
+        "RUN_STAGE": "small_real_slice",
+        "RUN_KIND": "modal",
+        "SMOKE_ONLY": "0",
+        "SKIP_INSTALL": "1",
+        "SKIP_SPS_MATH500_CALIBRATION": "0",
+        "MATH_CALIB_END": str(int(math_calib_end)),
+        "MATH_CALIB_MAX_NEW_TOKENS": str(int(math_calib_max_new_tokens)),
+        "MATH_CALIB_VLLM_MAX_MODEL_LEN": str(int(math_calib_vllm_max_model_len)),
+        "SPS_CALIBRATION_BASELINE_CONDITION": "bon_temp1",
+        "SPS_CALIBRATION_SAMPLES_PER_PROBLEM": str(int(sps_calibration_samples_per_problem)),
+        "SPS_REQUIRE_MCMC_APPROXIMATION": "0",
+        "SPS_MIN_SHARPENING_GAIN": str(float(sps_min_sharpening_gain)),
+        "SPS_MAX_CAPPED_FAILED_RATE": str(float(sps_max_capped_failed_rate)),
+        "SPS_ALPHA": str(float(sps_alpha)),
+        "RUN_BACKEND_PREFLIGHT": "1" if run_backend_preflight else "0",
+        "TRACKS": (
+            "reasoning_gym_boxnet reasoning_gym_acre "
+            "reasoning_gym_game_of_life_halting reasoning_gym_graph_color_n12"
+        ),
+        "ARCHIVE_TRAIN_TRACKS": (
+            "reasoning_gym_family_relationships reasoning_gym_graph_color_n10 "
+            "reasoning_gym_maze reasoning_gym_palindrome_generation "
+            "reasoning_gym_letter_counting"
+        ),
+        "ARCHIVE_HELDOUT_TRACKS": (
+            "reasoning_gym_boxnet reasoning_gym_acre "
+            "reasoning_gym_game_of_life_halting reasoning_gym_graph_color_n12"
+        ),
+        "CONDITIONS": "base_greedy sps_only gepa_sps_fixed prorl_v2_greedy",
+        "EVAL_START": "20",
+        "EVAL_END": "70",
+        "GEPA_DEV_START": "0",
+        "GEPA_DEV_END": "50",
+        "ROLLOUT_BUDGET": str(int(rollout_budget)),
+        "ARCHIVE_SIZE": str(int(archive_size)),
+        "MAX_METRIC_CALLS": str(int(max_metric_calls)),
+        "MAX_NEW_TOKENS": str(int(max_new_tokens)),
+        "VLLM_MAX_MODEL_LEN": str(int(vllm_max_model_len)),
+        "NUM_SHARDS": str(int(num_shards)),
+        "MAX_PARALLEL_CELLS": str(int(max_parallel_cells)),
+        "PROFILE_MAX_PARALLEL_CELLS": str(int(max_parallel_cells)),
+        "SPS_TOP_K": str(int(sps_top_k)),
+        "SPS_CANDIDATE_POOL_SIZE": str(int(sps_candidate_pool_size)),
+        "SPS_ROLLOUTS_PER_CANDIDATE": str(int(sps_rollouts_per_candidate)),
+        "SPS_ROLLOUT_HORIZON": str(int(sps_rollout_horizon)),
+        "SPS_VLLM_BATCH_SIZE": "64",
+        "REFLECTION_PROVIDER": "local-hf",
+        "INCLUDE_CANDIDATES": "0",
+    }
+    try:
+        summary = _run_python_json(
+            f"""
+import csv
+import json
+import os
+import subprocess
+from pathlib import Path
+
+env = os.environ.copy()
+env.update({env_overrides!r})
+run_root = Path({run_root!r})
+run_root.mkdir(parents=True, exist_ok=True)
+log_path = run_root / "modal_subprocess.log"
+proc = subprocess.Popen(
+    ["bash", "/proicl/scripts/run_experiment.sh", "h100"],
+    cwd="/proicl",
+    env=env,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    bufsize=1,
+)
+with log_path.open("a", encoding="utf-8") as log:
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            log.write(line)
+            log.flush()
+        returncode = proc.wait(timeout={int(60 * 60 * 24 - 600)})
+    except Exception:
+        proc.kill()
+        raise
+
+def read_json(path):
+    path = Path(path)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+def read_csv(path):
+    path = Path(path)
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+def tail_text(path, limit=6000):
+    path = Path(path)
+    if not path.exists():
+        return ""
+    data = path.read_bytes()[-limit:]
+    return data.decode("utf-8", errors="replace")
+
+run_dirs = sorted(run_root.glob("proicl_*"), key=lambda p: p.stat().st_mtime)
+latest = run_dirs[-1] if run_dirs else run_root
+full = latest / "full"
+bundle_root = latest / "results_bundle"
+sps_calibration_dir = (
+    latest
+    / "calibration"
+    / {sps_calibration_dirname!r}
+)
+summary_paths = {{
+    "launch_config": latest / "launch_config.json",
+    "resource_probe": latest / "resource_probe.json",
+    "backend_preflight": latest / "backend_preflight" / "backend_preflight.json",
+    "runtime_profile": latest / "runtime_profile.json",
+    "sps_calibration": sps_calibration_dir / "sps_calibration_summary.json",
+    "confound_checks": bundle_root / "summary" / "confound_checks.csv",
+    "metrics": bundle_root / "summary" / "metrics.csv",
+    "decomposition": full / "analysis" / "proicl_decomposition.json",
+}}
+bundles = sorted(latest.rglob("results_bundle.tar.gz"))
+payload = {{
+    "passed": returncode == 0,
+    "returncode": returncode,
+    "run_root": str(run_root),
+    "latest_run_dir": str(latest),
+    "subprocess_log": str(log_path),
+    "stdout_tail": tail_text(log_path),
+    "stderr_tail": "",
+    "bundle_paths": [str(path) for path in bundles],
+    "launch_config": read_json(summary_paths["launch_config"]),
+    "resource_probe": read_json(summary_paths["resource_probe"]),
+    "backend_preflight": read_json(summary_paths["backend_preflight"]),
+    "runtime_profile": read_json(summary_paths["runtime_profile"]),
+    "sps_calibration_summary": read_json(summary_paths["sps_calibration"]),
+    "confound_checks_path": str(summary_paths["confound_checks"]),
+    "confound_checks": read_csv(summary_paths["confound_checks"]),
+    "metrics_path": str(summary_paths["metrics"]),
+    "decomposition_path": str(summary_paths["decomposition"]),
+    "decomposition": read_json(summary_paths["decomposition"]),
+}}
+print("PROICL_JSON:" + json.dumps(payload, sort_keys=True))
+if returncode != 0:
+    raise SystemExit(returncode)
+""",
+            timeout=60 * 60 * 24,
+        )
+    finally:
+        runs_vol.commit()
+    print(f"run_heldout_goal_h100x4: {summary}")
+    return summary

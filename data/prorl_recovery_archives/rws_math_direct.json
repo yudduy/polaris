@@ -1,8 +1,0 @@
-[
-  {
-    "descriptor_hint": "rws_cot_direct",
-    "id": "direct",
-    "prefix": "Can you solve the following math problem? ",
-    "suffix": " Please reason step by step, and put your final answer within \\boxed{{}}."
-  }
-]

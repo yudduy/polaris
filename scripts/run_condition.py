@@ -63,7 +63,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--preregistration-anchor", required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--backend", choices=["hf", "vllm"], default="hf")
+    parser.add_argument("--backend", choices=["hf", "vllm", "sglang"], default="hf")
+    parser.add_argument("--sglang-base-url", default="http://localhost:30000")
     parser.add_argument("--samples-per-problem", type=int, default=None)
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=None)
@@ -90,6 +91,12 @@ def _parse_args() -> argparse.Namespace:
         choices=["mcmc", "sps"],
         default="mcmc",
         help="Power-sampling implementation for alpha>1 candidates.",
+    )
+    parser.add_argument(
+        "--fixed-alpha",
+        type=float,
+        default=None,
+        help="Override power-sampling alpha for calibration/sweeps.",
     )
     parser.add_argument("--shard-id", type=int, default=None)
     parser.add_argument("--num-shards", type=int, default=None)
@@ -172,7 +179,7 @@ def _resolve_power_block_num(args: argparse.Namespace) -> int | None:
 
 
 def _protocol_sync_passed() -> bool:
-    guard = REPO_ROOT / "scripts" / "check_protocol_sync.sh"
+    guard = REPO_ROOT / "scripts" / "preflight" / "check_protocol_sync.sh"
     if not guard.exists():
         return True
     result = subprocess.run(
@@ -241,8 +248,8 @@ def main() -> None:
 
     validate_model_for_track(args.model_key, args.track)
     validate_condition_for_track(args.condition, args.track)
-    if args.power_sampler == "sps" and args.backend != "vllm":
-        raise SystemExit("power_sampler=sps currently requires --backend vllm")
+    if args.power_sampler == "sps" and args.backend not in {"vllm", "sglang"}:
+        raise SystemExit("power_sampler=sps currently requires --backend vllm or sglang")
     model = resolve_model(args.model_key)
     model_revision = args.model_revision or model.revision
     protocol_sync = _protocol_sync_passed()
@@ -359,7 +366,7 @@ def main() -> None:
             seed=args.seed,
             local_files_only=args.local_files_only,
         )
-    else:
+    elif args.backend == "vllm":
         from polaris.infra.serving.vllm import VLLMGenerator
 
         sampler = VLLMGenerator(
@@ -376,6 +383,14 @@ def main() -> None:
             parity_artifact_path=str(vllm_parity_artifact_for_condition)
             if vllm_parity_artifact_for_condition is not None
             else None,
+        )
+    else:
+        from polaris.infra.serving.sglang import SGLangGenerator
+
+        sampler = SGLangGenerator(
+            model_id=model.hf_id,
+            base_url=args.sglang_base_url,
+            seed=args.seed,
         )
     if sampler is None:
         serving_backend_metadata = {
@@ -470,6 +485,7 @@ def main() -> None:
             if power_block_num is not None
             else MCMC_BLOCK_NUM,
             power_sampler=args.power_sampler,
+            fixed_alpha=args.fixed_alpha,
             sps_top_k=args.sps_top_k,
             sps_candidate_pool_size=args.sps_candidate_pool_size,
             sps_rollouts_per_candidate=args.sps_rollouts_per_candidate,

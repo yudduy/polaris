@@ -7,7 +7,7 @@ from typing import Any, Iterable
 
 from polaris.core.archive import FrozenArchive, PromptEntry
 from polaris.evals.datasets.math500 import Problem
-from polaris.gepa_reflection import XAIReflectionConfig, reflection_manifest
+from polaris.gepa_reflection import reflection_manifest
 from polaris.io.rollouts import RolloutLedger
 from polaris.proicl.protocol import (
     ArchiveScope,
@@ -293,15 +293,7 @@ def build_cross_task_curriculum_archive(
     ledger = RolloutLedger(archive_construction=int(gepa_payload["total_metric_calls"]))
     ledger.write(out_dir / "rollouts.json")
 
-    reflection_config_payload = (
-        reflection_config
-        if reflection_config is not None
-        else (
-            XAIReflectionConfig.from_env(require_key=False)
-            if reflection_provider == "xai"
-            else None
-        )
-    )
+    reflection_config_payload = reflection_config
     reflection_usage = {}
     if reflection_lm is not None:
         reflection_usage = {

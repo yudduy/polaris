@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
@@ -67,7 +67,7 @@ def _parse_args() -> argparse.Namespace:
     archive.add_argument("--max-metric-calls", type=int, default=1000)
     archive.add_argument(
         "--reflection-provider",
-        choices=["none", "xai", "local-hf"],
+        choices=["none", "local-hf"],
         default="none",
     )
     archive.add_argument("--live-gepa", action="store_true")
@@ -150,7 +150,7 @@ def _cmd_build_archive(args: argparse.Namespace) -> None:
     if not args.dry_run and not args.live_gepa:
         raise ValueError("live GEPA archive construction requires --live-gepa")
     if not args.dry_run and args.reflection_provider == "none":
-        raise ValueError("live GEPA requires --reflection-provider xai or local-hf")
+        raise ValueError("live GEPA requires --reflection-provider local-hf")
 
     sampler = None
     scorer = None
@@ -165,10 +165,7 @@ def _cmd_build_archive(args: argparse.Namespace) -> None:
         from polaris.evals.verifiers.reasoning_gym import score_reasoning_gym
         from polaris.gepa_reflection import (
             LocalHFReflectionConfig,
-            XAIReflectionConfig,
-            load_env_file,
             make_local_hf_reflection_lm,
-            make_xai_reflection_lm,
         )
 
         model_spec = MODEL_REGISTRY[args.model_key]
@@ -198,23 +195,7 @@ def _cmd_build_archive(args: argparse.Namespace) -> None:
                 local_files_only=args.local_files_only,
             )
         scorer = score_reasoning_gym
-        if args.reflection_provider == "xai":
-            load_env_file(args.env_file)
-            reflection_config = XAIReflectionConfig.from_env(require_key=True)
-            reflection_config = XAIReflectionConfig(
-                api_key=reflection_config.api_key,
-                base_url=reflection_config.base_url,
-                model=reflection_config.model,
-                litellm_model=reflection_config.litellm_model,
-                input_price_per_million=reflection_config.input_price_per_million,
-                output_price_per_million=reflection_config.output_price_per_million,
-                initial_cost_cap_dollars=reflection_config.initial_cost_cap_dollars,
-                hard_cost_cap_dollars=reflection_config.hard_cost_cap_dollars,
-                temperature=args.reflection_temperature,
-                max_tokens=args.reflection_max_new_tokens,
-            )
-            reflection_lm = make_xai_reflection_lm(reflection_config)
-        elif args.reflection_provider == "local-hf":
+        if args.reflection_provider == "local-hf":
             reflection_config = LocalHFReflectionConfig(
                 model_id=args.reflection_model_id,
                 revision=args.reflection_revision,

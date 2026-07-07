@@ -9,9 +9,70 @@ from polaris.infra.preflight import RunKind
 from polaris.io.artifact_audit import PRODUCTION_ARTIFACTS, SEVEN_ARTIFACTS
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_RESOURCE_PROFILE_PATH = REPO_ROOT / "configs" / "prorl_live_resources.json"
 REQUIRED_PRODUCTION_ARTIFACTS = SEVEN_ARTIFACTS + PRODUCTION_ARTIFACTS
+DEFAULT_RESOURCE_PROFILE_PAYLOAD = {
+    "profiles": [
+        {
+            "key": "farmshare_l40_free",
+            "label": "FarmShare 4x L40S free shards",
+            "run_kind": "farmshare",
+            "role": "free bulk sampling and queued Phase 0/Phase 1 continuation",
+            "gpu_model": "l40s",
+            "gpu_count": 4,
+            "max_concurrent_jobs": 4,
+            "allowed_phases": ["phase0", "phase1", "phase2_low"],
+            "free": True,
+            "fallback_only": False,
+            "hourly_rate_dollars": 0.0,
+            "initial_spend_cap_dollars": 0.0,
+            "notes": "Use four independent one-GPU Slurm jobs; no tensor parallelism.",
+        },
+        {
+            "key": "flow_a100_weekend",
+            "label": "Mithril/Flow weekend 4x A100 80GB",
+            "run_kind": "flow",
+            "role": "weekend accelerator for Phase 1 catch-up and Phase 2 MCMC/GEPA/memory",
+            "gpu_model": "a100-80gb.sxm",
+            "gpu_count": 4,
+            "max_concurrent_jobs": 4,
+            "allowed_phases": ["phase1", "phase2", "phase3_debug"],
+            "free": False,
+            "fallback_only": False,
+            "max_bid_dollars_per_gpu_hour": 0.025,
+            "initial_spend_cap_dollars": 10.0,
+            "notes": "Preferred 4x total price <= $0.10/hr; check live Flow pricing before launch.",
+        },
+        {
+            "key": "modal_burst",
+            "label": "Modal burst/debug",
+            "run_kind": "modal",
+            "role": "Phase 3 mechanistic debugging and short vLLM/HF parity smokes",
+            "gpu_model": "l40s-or-a100",
+            "gpu_count": 1,
+            "max_concurrent_jobs": 1,
+            "allowed_phases": ["phase3", "debug"],
+            "free": False,
+            "fallback_only": False,
+            "initial_spend_cap_dollars": 25.0,
+            "notes": "Use only for bursty debug sessions; keep scale-to-zero discipline.",
+        },
+        {
+            "key": "cloudrift_fallback",
+            "label": "CloudRift RTX 4090 fallback",
+            "run_kind": "cloudrift",
+            "role": "fallback if FarmShare and Flow block",
+            "gpu_model": "rtx4090",
+            "gpu_count": 1,
+            "max_concurrent_jobs": 1,
+            "allowed_phases": ["probe", "phase1", "phase2_low"],
+            "free": False,
+            "fallback_only": True,
+            "hourly_rate_dollars": 0.25,
+            "initial_spend_cap_dollars": 25.0,
+            "notes": "Use explicit launch-time UI rate in costs.json.",
+        },
+    ]
+}
 
 
 @dataclass(frozen=True)
@@ -89,9 +150,13 @@ def validate_resource_profile(profile: ResourceProfile) -> None:
 
 
 def load_resource_profiles(
-    path: Path = DEFAULT_RESOURCE_PROFILE_PATH,
+    path: Path | None = None,
 ) -> dict[str, ResourceProfile]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = (
+        json.loads(path.read_text(encoding="utf-8"))
+        if path is not None
+        else DEFAULT_RESOURCE_PROFILE_PAYLOAD
+    )
     profiles: dict[str, ResourceProfile] = {}
     for raw in payload.get("profiles", []):
         profile = _profile_from_dict(raw)
@@ -100,14 +165,14 @@ def load_resource_profiles(
         validate_resource_profile(profile)
         profiles[profile.key] = profile
     if not profiles:
-        raise ValueError(f"no resource profiles found in {path}")
+        raise ValueError(f"no resource profiles found in {path or 'built-in defaults'}")
     return profiles
 
 
 def get_resource_profile(
     key: str,
     *,
-    path: Path = DEFAULT_RESOURCE_PROFILE_PATH,
+    path: Path | None = None,
 ) -> ResourceProfile:
     profiles = load_resource_profiles(path)
     try:

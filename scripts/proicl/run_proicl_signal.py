@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
@@ -104,6 +104,7 @@ def _parse_args() -> argparse.Namespace:
         default="mcmc",
         help="Use RWS/MH MCMC or Scalable Power Sampling for alpha>1 samples.",
     )
+    parser.add_argument("--fixed-alpha", type=float, default=None)
     parser.add_argument("--sps-top-k", type=int, default=8)
     parser.add_argument("--sps-candidate-pool-size", type=int, default=8)
     parser.add_argument("--sps-rollouts-per-candidate", type=int, default=8)
@@ -139,9 +140,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cost-cap-dollars", type=float, default=0.0)
     parser.add_argument("--estimated-dollar-cost-per-cell", type=float, default=0.0)
     parser.add_argument("--estimated-wall-clock-seconds-per-cell", type=float, default=7200)
-    parser.add_argument("--reflection-provider", choices=["xai", "local-hf"], default="local-hf")
+    parser.add_argument("--reflection-provider", choices=["local-hf"], default="local-hf")
     parser.add_argument("--reflection-model-id", default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--xai-reflection-cap-dollars", type=float, default=2.0)
     parser.add_argument("--env-file", type=Path, default=REPO_ROOT / ".env")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--skip-smoke", action="store_true")
@@ -219,9 +219,6 @@ def _setup_env(args: argparse.Namespace) -> dict[str, str]:
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    if args.reflection_provider == "xai":
-        env["XAI_REFLECTION_INITIAL_CAP_DOLLARS"] = str(args.xai_reflection_cap_dollars)
-        env["XAI_REFLECTION_HARD_CAP_DOLLARS"] = str(args.xai_reflection_cap_dollars)
     env.setdefault("PROICL_RWS_COMMIT", vendored_commit(REPO_ROOT, "upstream/reasoning-with-sampling"))
     env.setdefault("PROICL_GEPA_COMMIT", vendored_commit(REPO_ROOT, "upstream/gepa"))
     env.setdefault("PROICL_EVALPLUS_COMMIT", vendored_commit(REPO_ROOT, "upstream/evalplus"))
@@ -350,7 +347,7 @@ def _build_direct_archives(root: Path, tracks: list[str]) -> None:
     _run(
         [
             sys.executable,
-            "scripts/run_proicl.py",
+            "scripts/proicl/run_proicl.py",
             "write-direct-archives",
             "--root",
             str(root),
@@ -429,7 +426,7 @@ def _gepa_archive_command(
     heldout_tracks = list(getattr(args, "archive_heldout_tracks", None) or getattr(args, "tracks", tracks))
     cmd = [
             sys.executable,
-            "scripts/run_proicl.py",
+            "scripts/proicl/run_proicl.py",
             "build-archive",
             "--out",
             str(out),
@@ -653,6 +650,7 @@ def _run_cells_for_root(
             power_sampler=args.power_sampler,
             mcmc_steps=args.mcmc_steps,
             mcmc_block_num=args.mcmc_block_num,
+            fixed_alpha=args.fixed_alpha,
             sps_top_k=args.sps_top_k,
             sps_candidate_pool_size=args.sps_candidate_pool_size,
             sps_rollouts_per_candidate=args.sps_rollouts_per_candidate,
@@ -708,6 +706,7 @@ def _run_cell_list(
             power_sampler=args.power_sampler,
             mcmc_steps=args.mcmc_steps,
             mcmc_block_num=args.mcmc_block_num,
+            fixed_alpha=args.fixed_alpha,
             sps_top_k=args.sps_top_k,
             sps_candidate_pool_size=args.sps_candidate_pool_size,
             sps_rollouts_per_candidate=args.sps_rollouts_per_candidate,
@@ -788,6 +787,7 @@ def main() -> None:
             mcmc_steps=args.mcmc_steps,
             mcmc_block_num=args.mcmc_block_num,
             power_sampler=args.power_sampler,
+            fixed_alpha=args.fixed_alpha,
             sps_top_k=args.sps_top_k,
             sps_candidate_pool_size=args.sps_candidate_pool_size,
             sps_rollouts_per_candidate=args.sps_rollouts_per_candidate,
@@ -798,7 +798,7 @@ def main() -> None:
             reflection_model_id=args.reflection_model_id,
             run_kind=args.run_kind,
             cost_cap_dollars=args.cost_cap_dollars,
-            notes="Created by scripts/run_proicl_signal.py --standard-run-root.",
+            notes="Created by scripts/proicl/run_proicl_signal.py --standard-run-root.",
         )
     args.root = args.root.resolve()
     args.root.mkdir(parents=True, exist_ok=True)

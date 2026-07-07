@@ -38,7 +38,7 @@ from polaris.proicl.run_graph import (
     build_proicl_run_graph,
 )
 from polaris.runners.condition_runner import run_condition
-from scripts.run_proicl_signal import (
+from scripts.proicl.run_proicl_signal import (
     DEFAULT_SIGNAL_TRACKS,
     _archive_is_live,
     _gepa_archive_command,
@@ -791,6 +791,13 @@ def test_proicl_decomposition_accepts_sps_aliases():
     assert report["A_gepa_mcmc"] == 0.45
     assert report["RF_sps"] == pytest.approx(0.40)
     assert report["RF_gepa_sps_fixed"] == pytest.approx(0.70)
+    assert report["confound_delta_gepa_archive_sps_vs_base_sps"] == pytest.approx(0.15)
+    assert report["confound_check_base_sps_vs_gepa_archive_sps"] == {
+        "base_sps_accuracy": 0.30,
+        "gepa_archive_sps_accuracy": 0.45,
+        "delta": pytest.approx(0.15),
+        "status": "gepa_archive_sps_above_base_sps",
+    }
 
 
 def test_proicl_decomposition_tolerates_nonpositive_rf_denominator():
@@ -845,6 +852,7 @@ def test_proicl_aggregate_reads_shard_metrics(tmp_path):
     text = md.read_text()
     assert "discovery_gain" in text
     assert "composition_gain" in text
+    assert "confound_delta_gepa_archive_sps_vs_base_sps" in text
 
 
 def test_cross_task_curriculum_archive_writes_k16_gepa_artifacts(tmp_path):

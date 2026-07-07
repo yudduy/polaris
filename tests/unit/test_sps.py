@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 import math
-from pathlib import Path
 
 from polaris.core.sps import sps_candidate_probabilities
 
@@ -68,19 +67,3 @@ def test_sps_jackknife_matches_leave_one_out_bias_correction():
 
     assert corrected == pytest.approx(expected)
     assert sum(corrected) == pytest.approx(1.0)
-
-
-def test_eval_config_records_sps_paper_contract():
-    text = (Path(__file__).resolve().parents[2] / "configs" / "eval.yaml").read_text(
-        encoding="utf-8"
-    )
-
-    assert "implementation: scalable_power_sampling" in text
-    assert "target_distribution: p_alpha" in text
-    assert "approximation: scaled_low_temperature_with_future_lookahead" in text
-    assert "verifier_free_sampling: true" in text
-    assert "jackknife_correction: true" in text
-    assert "alpha: 4" in text
-    assert "top_k: 8" in text
-    assert "candidate_pool_size: 8" in text
-    assert "rollouts_per_candidate: 8" in text

@@ -5,6 +5,7 @@ description = "ProICL: inference-time composition for RL-style reasoning gains (
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "accelerate",
+  "appdirs",
   "datasets==4.0.0",
   "huggingface-hub>=0.33.0,<1.0",
   "numpy>=1.26,<2.3",
@@ -14,20 +15,20 @@ dependencies = [
   "reasoning-gym==0.1.25",
   "scipy",
   "sympy",
+  "tempdir",
   "torch",
   "tqdm",
   "transformers==4.51.3",
   "wandb",
+  "wget",
 ]
 
 [project.optional-dependencies]
 code = [
   # Required when running the HumanEval+ code track (vendored evalplus)
-  "appdirs",
   "termcolor",
   "tree-sitter",
   "tree-sitter-python",
-  "wget",
 ]
 dc = [
   # Required when running the Dynamic Cheatsheet comparator (vendored dc)
@@ -35,11 +36,6 @@ dc = [
   "scikit-learn",
   "tiktoken",
 ]
-gepa_reflection = [
-  # Required for live xAI/OpenAI-compatible GEPA reflection calls.
-  "litellm",
-]
-
 [tool.setuptools.packages.find]
 where = ["src"]
 

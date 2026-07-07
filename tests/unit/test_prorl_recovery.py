@@ -71,7 +71,7 @@ def test_farmshare_slurm_array_can_render_phase_matrices():
     script = render_slurm_array(
         SlurmArraySpec(
             job_name="phase1",
-            command="python scripts/run_prorl_recovery.py run-cell --phase phase1",
+            command="python scripts/run_condition.py --track math500",
             num_shards=4,
             array_tasks=16,
             max_concurrent=4,
@@ -177,7 +177,7 @@ def test_prorl_recovery_phase_cells_and_commands_are_locked():
     assert "--memory-mode" in cmd
     assert "--vllm-dtype" in cmd
     assert "bfloat16" in cmd
-    assert "$POLARIS_REPO_DIR/data/prorl_recovery_archives/reasoning_gym_seed_archive.json" in cmd
+    assert "$POLARIS_REPO_DIR/runs/generated/prorl_recovery_archives/reasoning_gym_seed_archive.json" in cmd
 
 
 def test_exact_rws_phase0_cells_match_upstream_shard_seed_matrix():
@@ -316,66 +316,6 @@ def test_cloudrift_preflight_and_estimator_fail_closed(tmp_path):
     ).rate_source == "explicit_ui_rate"
     assert cloudrift_environment()["HF_HOME"] == "/workspace/.cache/huggingface"
     assert recommended_gpu_order() == ("rtx4090", "v100_sxm3")
-
-
-def test_prorl_recovery_plan_cli_can_select_math500_only(tmp_path):
-    out = tmp_path / "plan.json"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/run_prorl_recovery.py",
-            "plan",
-            "--phase",
-            "phase1",
-            "--tracks",
-            "math500",
-            "--problem-count",
-            "20",
-            "--samples-per-problem",
-            "16",
-            "--out",
-            str(out),
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    payload = json.loads(out.read_text(encoding="utf-8"))
-
-    assert json.loads(result.stdout)["cells"] == 16
-    assert {cell["track"] for cell in payload["cells"]} == {"math500"}
-    assert {cell["samples_per_problem"] for cell in payload["cells"]} == {16}
-    assert all("$USER" not in cell["out_dir"] for cell in payload["cells"])
-    assert all("/runs/prorl_recovery/" in cell["out_dir"] for cell in payload["cells"])
-
-
-def test_prorl_recovery_cli_renders_exact_rws_plan(tmp_path):
-    out = tmp_path / "rws_exact.json"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/run_prorl_recovery.py",
-            "plan-rws-exact",
-            "--root",
-            "/scratch/users/$USER/polaris/runs/prorl_recovery",
-            "--out",
-            str(out),
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    payload = json.loads(out.read_text(encoding="utf-8"))
-
-    assert json.loads(result.stdout)["cells"] == 40
-    assert payload["kind"] == "rws_exact_upstream"
-    assert len(payload["cells"]) == 40
-    assert payload["cells"][0]["batch_idx"] == 0
-    assert payload["cells"][0]["seed"] == 0
-    assert payload["cells"][-1]["batch_idx"] == 4
-    assert payload["cells"][-1]["seed"] == 7
 
 
 def test_write_archive_outputs_direct_and_seed_archive(tmp_path):
@@ -826,55 +766,6 @@ def test_phase1_aggregation_writes_parquet_and_passk(tmp_path):
     assert score16["all_score_mean"] == pytest.approx((0.25 + 0.75 + 1.0) / 3)
 
 
-def test_phase1_aggregate_cli_accepts_root_path(tmp_path):
-    run_dir = tmp_path / "phase1" / "math500" / "base" / "shard-0"
-    run_dir.mkdir(parents=True)
-    (run_dir / "manifest.json").write_text(
-        json.dumps(
-            {
-                "model_id": "model",
-                "benchmark": "MATH500",
-                "config": {"model_key": "base", "track": "math500"},
-            }
-        ),
-        encoding="utf-8",
-    )
-    (run_dir / "preflight.json").write_text(json.dumps({"backend": "vllm"}), encoding="utf-8")
-    (run_dir / "candidates.jsonl").write_text(
-        json.dumps(
-            {
-                "problem_id": "p0",
-                "sample_index": 0,
-                "generation": "ok",
-                "generation_token_count": 2,
-                "verifier_result": {"passed": True},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/run_prorl_recovery.py",
-            "aggregate-phase1",
-            "--root",
-            str(tmp_path),
-            "--out",
-            str(tmp_path / "phase1_results.parquet"),
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        text=True,
-        capture_output=True,
-        check=False,
-        env={**os.environ, "PYTHONPATH": "src"},
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert (tmp_path / "phase1_results.parquet").exists()
-
-
 def test_phase0_gate_aggregation_uses_registered_threshold(tmp_path):
     run_dir = tmp_path / "phase0" / "karan_du_replication" / "shard-0"
     run_dir.mkdir(parents=True)
@@ -1057,86 +948,6 @@ def test_phase3_trajectory_materialization_uses_successful_raw_candidate():
             "sample_index": 3,
         }
     ]
-
-
-def test_phase3_script_refuses_missing_inputs(tmp_path):
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/derive_prorl_phase3_input.py",
-            "--phase1",
-            str(tmp_path / "missing1.jsonl"),
-            "--rung7",
-            str(tmp_path / "missing2.jsonl"),
-            "--out",
-            str(tmp_path / "phase3.jsonl"),
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        text=True,
-        capture_output=True,
-        check=False,
-        env={**os.environ, "PYTHONPATH": "src"},
-    )
-
-    assert result.returncode != 0
-    assert "missing required Phase 3 inputs" in result.stderr
-
-
-def test_phase3_trajectory_materialization_cli(tmp_path):
-    phase3_path = tmp_path / "phase3_input_set.jsonl"
-    candidates_dir = tmp_path / "phase1" / "math500" / "nemotron-prorl-v2" / "shard-0"
-    candidates_dir.mkdir(parents=True)
-    phase3_path.write_text(
-        json.dumps(
-            {
-                "task_family": "math500",
-                "problem_id": "a",
-                "checkpoint": "nemotron-prorl-v2",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    (candidates_dir / "candidates.jsonl").write_text(
-        json.dumps(
-            {
-                "task_family": "math500",
-                "checkpoint": "nemotron-prorl-v2",
-                "problem_id": "a",
-                "candidate_id": "c0",
-                "sample_index": 0,
-                "prompt_text": "Q",
-                "generation": "A",
-                "verifier_result": {"passed": True},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/materialize_prorl_phase3_trajectories.py",
-            "--phase3-input",
-            str(phase3_path),
-            "--phase1-root",
-            str(tmp_path / "phase1"),
-            "--out",
-            str(tmp_path / "trajectories.jsonl"),
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        text=True,
-        capture_output=True,
-        check=False,
-        env={**os.environ, "PYTHONPATH": "src"},
-    )
-
-    assert result.returncode == 0, result.stderr
-    row = json.loads((tmp_path / "trajectories.jsonl").read_text(encoding="utf-8"))
-    assert row["row_id"] == "c0"
-    assert row["prompt_text"] == "Q"
-    assert row["response_text"] == "A"
 
 
 def test_rf_and_bucket_rules_are_preregistered():

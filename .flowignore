@@ -1,8 +1,0 @@
-.env
-.venv-eval/
-.pytest_cache/
-__pycache__/
-*.pyc
-.DS_Store
-runs/
-upstream/

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_RUN_ROOT="$(mktemp -d)"
 tmpbin=""
 trap 'rm -rf "$TEST_RUN_ROOT" "${tmpbin:-}"' EXIT
@@ -54,7 +54,7 @@ out="$(run_case doctor-h100 \
   SLURM_STEP_GPUS=0 \
   bash "$ROOT/scripts/run_experiment.sh" h100 --doctor)"
 assert_contains "$out" "ProICL doctor:"
-assert_contains "$out" "constraints=constraints/proicl-eval.txt"
+assert_contains "$out" "constraints=none"
 test -f "$doctor_root/cluster_probe.json"
 rm -rf "$doctor_root"
 

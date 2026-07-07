@@ -17,20 +17,141 @@ def test_sglang_generator_uses_injected_transport_for_greedy():
     def transport(endpoint, payload):
         calls.append((endpoint, payload))
         return {
-            "choices": [{"text": "\\boxed{1}", "token_ids": [10, 11]}],
-            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+            "text": "\\boxed{1}",
+            "output_ids": [10, 11],
+            "meta_info": {"prompt_tokens": 4, "completion_tokens": 2},
         }
 
     gen = SGLangGenerator(model_id="m", transport=transport)
     out = gen.generate_greedy("Q", max_new_tokens=8)
 
-    assert calls[0][0] == "/v1/completions"
-    assert calls[0][1]["temperature"] == 0.0
-    assert calls[0][1]["max_tokens"] == 8
+    assert calls[0][0] == "/generate"
+    assert calls[0][1]["text"] == "Q"
+    assert calls[0][1]["stream"] is False
+    assert calls[0][1]["sampling_params"]["temperature"] == 0.0
+    assert calls[0][1]["sampling_params"]["max_new_tokens"] == 8
     assert out.generation == "\\boxed{1}"
     assert out.prompt_token_count == 4
     assert out.generation_token_count == 2
     assert out.token_ids == [10, 11]
+
+
+def test_sglang_low_temp_batch_uses_native_generate():
+    calls = []
+
+    def transport(endpoint, payload):
+        calls.append((endpoint, payload))
+        return [
+            {
+                "text": "A",
+                "output_ids": [1],
+                "meta_info": {"prompt_tokens": 3, "completion_tokens": 1},
+            },
+            {
+                "text": "B",
+                "output_ids": [2, 3],
+                "meta_info": {"prompt_tokens": 4, "completion_tokens": 2},
+            },
+        ]
+
+    gen = SGLangGenerator(model_id="m", transport=transport)
+    outs = gen.generate_low_temp_batch(
+        ["Q1", "Q2"],
+        temperature=0.6,
+        top_p=0.95,
+        max_new_tokens=8,
+        seed_base=10,
+        seed_offsets=[0, 7],
+    )
+
+    assert calls == [
+        (
+            "/generate",
+            {
+                "text": ["Q1", "Q2"],
+                "sampling_params": [
+                    {
+                        "max_new_tokens": 8,
+                        "temperature": 0.6,
+                        "sampling_seed": 10,
+                        "top_p": 0.95,
+                    },
+                    {
+                        "max_new_tokens": 8,
+                        "temperature": 0.6,
+                        "sampling_seed": 17,
+                        "top_p": 0.95,
+                    },
+                ],
+                "stream": False,
+            },
+        )
+    ]
+    assert [out.generation for out in outs] == ["A", "B"]
+    assert [out.generation_token_count for out in outs] == [1, 2]
+
+
+def test_sglang_sps_power_batch_uses_native_generate_power_sampling():
+    calls = []
+
+    def transport(endpoint, payload):
+        calls.append((endpoint, payload))
+        return [
+            {
+                "text": "A",
+                "output_ids": [1],
+                "meta_info": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "power_sampling": {
+                        "alpha": 4.0,
+                        "block_count": 1,
+                        "candidate_count": 8,
+                        "rollout_count": 8,
+                    },
+                },
+            },
+            {
+                "text": "B",
+                "output_ids": [2],
+                "meta_info": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 1,
+                    "power_sampling": {
+                        "alpha": 4.0,
+                        "block_count": 1,
+                        "candidate_count": 8,
+                        "rollout_count": 8,
+                    },
+                },
+            },
+        ]
+
+    gen = SGLangGenerator(model_id="m", transport=transport)
+    outs = gen.generate_sps_power_batch(
+        ["Q1", "Q2"],
+        temperature=0.25,
+        max_new_tokens=256,
+        block_num=64,
+        top_k=8,
+        candidate_pool_size=8,
+        rollouts_per_candidate=8,
+        rollout_horizon=64,
+        seed_base=0,
+        seed_offsets=[0, 1],
+    )
+
+    params = calls[0][1]["sampling_params"]
+    assert calls[0][0] == "/generate"
+    assert calls[0][1]["text"] == ["Q1", "Q2"]
+    assert params[0]["max_new_tokens"] == 256
+    assert "temperature" not in params[0]
+    assert "top_p" not in params[0]
+    assert params[0]["power_sampling"]["alpha"] == 4.0
+    assert params[0]["power_sampling"]["block_size"] == 64
+    assert params[0]["power_sampling"]["seed"] == 0
+    assert params[1]["power_sampling"]["seed"] == 1
+    assert outs[0].power_sampling["candidate_count"] == 8
 
 
 def test_sglang_score_segments_uses_norm_and_base_requests():

@@ -500,6 +500,7 @@ def run_condition_command(
     power_sampler: str = "mcmc",
     mcmc_steps: int | None = None,
     mcmc_block_num: int | None = None,
+    fixed_alpha: float | None = None,
     sps_top_k: int = 8,
     sps_candidate_pool_size: int = 8,
     sps_rollouts_per_candidate: int = 8,
@@ -597,6 +598,8 @@ def run_condition_command(
         cmd.extend(["--mcmc-steps", str(mcmc_steps)])
     if mcmc_block_num is not None:
         cmd.extend(["--mcmc-block-num", str(mcmc_block_num)])
+    if fixed_alpha is not None and cell.uses_power_sampling:
+        cmd.extend(["--fixed-alpha", str(fixed_alpha)])
     cmd.extend(
         [
             "--sps-top-k",
@@ -653,6 +656,7 @@ def run_cells(
     power_sampler: str = "mcmc",
     mcmc_steps: int | None = None,
     mcmc_block_num: int | None = None,
+    fixed_alpha: float | None = None,
     sps_top_k: int = 8,
     sps_candidate_pool_size: int = 8,
     sps_rollouts_per_candidate: int = 8,
@@ -706,6 +710,7 @@ def run_cells(
                     power_sampler=power_sampler,
                     mcmc_steps=mcmc_steps,
                     mcmc_block_num=mcmc_block_num,
+                    fixed_alpha=fixed_alpha,
                     sps_top_k=sps_top_k,
                     sps_candidate_pool_size=sps_candidate_pool_size,
                     sps_rollouts_per_candidate=sps_rollouts_per_candidate,

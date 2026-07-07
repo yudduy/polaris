@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import shutil
 import tarfile
 from pathlib import Path
@@ -66,17 +67,45 @@ def _condition_key(path: Path) -> tuple[str, str, str]:
     return track, condition, shard
 
 
+def _wilson_interval(correct: int, n: int, *, z: float = 1.96) -> tuple[float | None, float | None]:
+    if n <= 0:
+        return None, None
+    phat = correct / n
+    denom = 1.0 + z * z / n
+    center = (phat + z * z / (2.0 * n)) / denom
+    half = z * math.sqrt((phat * (1.0 - phat) + z * z / (4.0 * n)) / n) / denom
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+def _selected_correct_count(path: Path) -> tuple[int, int] | None:
+    rows = _jsonl(path)
+    if not rows:
+        return None
+    return sum(1 for row in rows if bool(row.get("selected_passed"))), len(rows)
+
+
+def _metrics_correct_count(metrics: dict[str, Any]) -> tuple[int, int]:
+    n = int(metrics.get("n_problems") or 0)
+    accuracy = float(metrics.get("accuracy") or 0.0)
+    return int(round(accuracy * n)), n
+
+
 def _collect_metrics(full_root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for metrics_path in sorted((full_root / "runs").glob("*/*/shard-*/metrics.json")):
         track, condition, shard = _condition_key(metrics_path)
         metrics = _json(metrics_path)
+        correct, n = _selected_correct_count(metrics_path.parent / "selected.jsonl") or _metrics_correct_count(metrics)
+        ci_low, ci_high = _wilson_interval(correct, n)
         rows.append(
             {
                 "track": track,
                 "condition": condition,
                 "shard": shard,
                 "accuracy": metrics.get("accuracy"),
+                "correct": correct,
+                "ci95_low": ci_low,
+                "ci95_high": ci_high,
                 "mean_selected_score": metrics.get("mean_selected_score"),
                 "n_problems": metrics.get("n_problems"),
                 "n_candidates": metrics.get("n_candidates"),
@@ -153,6 +182,75 @@ def _agreement_rows(selected_rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     ]
 
 
+def _confound_rows(selected_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in selected_rows:
+        condition = str(row.get("condition"))
+        if condition not in {"sps_only", "gepa_sps_fixed"}:
+            continue
+        track = str(row.get("track"))
+        problem_id = str(row.get("problem_id"))
+        grouped.setdefault(track, {}).setdefault(problem_id, {})[condition] = row
+
+    rows: list[dict[str, Any]] = []
+    for track, problems in sorted(grouped.items()):
+        paired = [payload for payload in problems.values() if "sps_only" in payload and "gepa_sps_fixed" in payload]
+        common_n = len(paired)
+        sps_correct = sum(1 for payload in paired if bool(payload["sps_only"].get("selected_passed")))
+        gepa_correct = sum(1 for payload in paired if bool(payload["gepa_sps_fixed"].get("selected_passed")))
+        both = sum(
+            1
+            for payload in paired
+            if bool(payload["sps_only"].get("selected_passed"))
+            and bool(payload["gepa_sps_fixed"].get("selected_passed"))
+        )
+        sps_only_passed = sum(
+            1
+            for payload in paired
+            if bool(payload["sps_only"].get("selected_passed"))
+            and not bool(payload["gepa_sps_fixed"].get("selected_passed"))
+        )
+        gepa_only_passed = sum(
+            1
+            for payload in paired
+            if not bool(payload["sps_only"].get("selected_passed"))
+            and bool(payload["gepa_sps_fixed"].get("selected_passed"))
+        )
+        neither = common_n - both - sps_only_passed - gepa_only_passed
+        sps_rate = sps_correct / common_n if common_n else None
+        gepa_rate = gepa_correct / common_n if common_n else None
+        sps_low, sps_high = _wilson_interval(sps_correct, common_n)
+        gepa_low, gepa_high = _wilson_interval(gepa_correct, common_n)
+        delta = None if sps_rate is None or gepa_rate is None else gepa_rate - sps_rate
+        if common_n == 0:
+            status = "missing_paired_base_sps_and_gepa_archive_sps"
+        elif delta is not None and delta > 0.0:
+            status = "gepa_archive_sps_above_base_sps"
+        else:
+            status = "no_gepa_archive_sps_gain_over_base_sps"
+        rows.append(
+            {
+                "track": track,
+                "common_n": common_n,
+                "sps_correct": sps_correct,
+                "gepa_sps_correct": gepa_correct,
+                "both_passed": both,
+                "sps_only_passed": sps_only_passed,
+                "gepa_only_passed": gepa_only_passed,
+                "neither_passed": neither,
+                "sps_pass_rate": sps_rate,
+                "gepa_sps_pass_rate": gepa_rate,
+                "sps_ci95_low": sps_low,
+                "sps_ci95_high": sps_high,
+                "gepa_sps_ci95_low": gepa_low,
+                "gepa_sps_ci95_high": gepa_high,
+                "gepa_minus_sps": delta,
+                "confound_status": status,
+            }
+        )
+    return rows
+
+
 def _copy_cell_artifacts(full_root: Path, bundle_root: Path, *, include_candidates: bool) -> None:
     rels = [
         "metrics.json",
@@ -191,15 +289,11 @@ def _copy_top_level(full_root: Path, run_root: Path, bundle_root: Path) -> None:
         _copy_if_exists(full_root / rel, bundle_root / "full" / rel)
     if (full_root / "analysis").exists():
         shutil.copytree(full_root / "analysis", bundle_root / "analysis", dirs_exist_ok=True)
+    if (run_root / "probes").exists():
+        shutil.copytree(run_root / "probes", bundle_root / "probes", dirs_exist_ok=True)
     for manifest in sorted((full_root / "archives").glob("*/archive_build_manifest.json")):
         dst = bundle_root / "archives" / manifest.parent.name / "archive_build_manifest.json"
         _copy_if_exists(manifest, dst)
-    repo_root = Path(__file__).resolve().parents[1]
-    for rel in [
-        "configs/archive_build.yaml",
-        "configs/eval.yaml",
-    ]:
-        _copy_if_exists(repo_root / rel, bundle_root / rel)
 
 
 def _make_tarball(bundle_root: Path) -> Path:
@@ -226,6 +320,7 @@ def main() -> None:
     metrics_rows = _collect_metrics(full_root)
     selected_rows = _collect_selected(full_root)
     agreement_rows = _agreement_rows(selected_rows)
+    confound_rows = _confound_rows(selected_rows)
 
     _write_csv(
         out / "summary" / "metrics.csv",
@@ -235,6 +330,9 @@ def main() -> None:
             "condition",
             "shard",
             "accuracy",
+            "correct",
+            "ci95_low",
+            "ci95_high",
             "mean_selected_score",
             "n_problems",
             "n_candidates",
@@ -271,6 +369,28 @@ def main() -> None:
     else:
         fields = ["track", "problem_id"]
     _write_csv(out / "summary" / "per_problem_agreement.csv", agreement_rows, fields)
+    _write_csv(
+        out / "summary" / "confound_checks.csv",
+        confound_rows,
+        [
+            "track",
+            "common_n",
+            "sps_correct",
+            "gepa_sps_correct",
+            "both_passed",
+            "sps_only_passed",
+            "gepa_only_passed",
+            "neither_passed",
+            "sps_pass_rate",
+            "gepa_sps_pass_rate",
+            "sps_ci95_low",
+            "sps_ci95_high",
+            "gepa_sps_ci95_low",
+            "gepa_sps_ci95_high",
+            "gepa_minus_sps",
+            "confound_status",
+        ],
+    )
 
     _copy_top_level(full_root, run_root, out)
     _copy_cell_artifacts(full_root, out, include_candidates=args.include_candidates)
@@ -281,6 +401,7 @@ def main() -> None:
         "metrics_rows": len(metrics_rows),
         "selected_rows": len(selected_rows),
         "agreement_rows": len(agreement_rows),
+        "confound_rows": len(confound_rows),
         "included_candidates": bool(args.include_candidates),
     }
     (out / "bundle_manifest.json").write_text(

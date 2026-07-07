@@ -64,6 +64,7 @@ TRACK_TOKEN_CAPS: dict[str, int] = {
     "reasoning_gym_graph_color_n20": 8192,
     "reasoning_gym_family_relationships": 8192,
 }
+GENERATED_PRORL_ARCHIVE_REL = "runs/generated/prorl_recovery_archives"
 
 
 @dataclass(frozen=True)
@@ -351,6 +352,19 @@ def direct_archive_kind_for_track(track: str) -> str:
 
 def seed_archive_kind_for_track(track: str) -> str:
     return "reasoning_gym_seed_archive" if track.startswith("reasoning_gym_") else "seed_archive"
+
+
+def recovery_archive_path(kind: str, *, repo_dir: str = "$POLARIS_REPO_DIR") -> str:
+    return f"{repo_dir}/{GENERATED_PRORL_ARCHIVE_REL}/{kind}.json"
+
+
+def ensure_recovery_archive(kind: str, *, repo_dir: str | Path) -> Path:
+    raw_repo_dir = os.path.expandvars(str(repo_dir))
+    if "$" in raw_repo_dir:
+        raise ValueError(f"repo_dir must be concrete to generate archives: {repo_dir!r}")
+    path = Path(raw_repo_dir) / GENERATED_PRORL_ARCHIVE_REL / f"{kind}.json"
+    write_archive(path, kind=kind)
+    return path
 
 
 def write_archive(path: Path, *, kind: str) -> None:
@@ -729,7 +743,7 @@ def cell_command(
     user_authorized_paid_run: bool = False,
 ) -> list[str]:
     model_revision = MODEL_REGISTRY[cell.model_key].get("revision")
-    archive_path = f"{repo_dir}/data/prorl_recovery_archives/{cell.archive_kind}.json"
+    archive_path = recovery_archive_path(cell.archive_kind, repo_dir=repo_dir)
     cmd = [
         "python",
         "scripts/run_condition.py",
