@@ -68,6 +68,19 @@ assert_contains "$out" "No ProICL runs found"
 assert_not_contains "$out" "ProICL launch profile:"
 rm -rf "$status_empty_root"
 
+stop_gepa_root="$(mktemp -d)"
+stop_gepa_run="$stop_gepa_root/proicl_small-real-slice_custom-4t_cross-family-curriculum_vllm_heldout_20260529T115000Z"
+mkdir -p "$stop_gepa_run/full/archives/proicl_cross_family_curriculum_test/gepa_run"
+out="$(run_case stop-gepa \
+  DRY_RUN=1 \
+  SKIP_INSTALL=1 \
+  RUN_ROOT="$stop_gepa_root" \
+  bash "$ROOT/scripts/run_experiment.sh" --stop-gepa latest)"
+assert_contains "$out" "requested_gepa_stop="
+assert_not_contains "$out" "ProICL launch profile:"
+test -f "$stop_gepa_run/full/archives/proicl_cross_family_curriculum_test/gepa_run/gepa.stop"
+rm -rf "$stop_gepa_root"
+
 status_root="$(mktemp -d)"
 status_run="$status_root/proicl_small-real-slice_custom-4t_cross-family-curriculum_vllm_heldout_20260529T120000Z"
 status_cell="$status_run/full/runs/reasoning_gym_boxnet/sps_only/shard-0"

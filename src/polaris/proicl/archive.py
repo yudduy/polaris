@@ -172,6 +172,8 @@ def _run_live_gepa(
     from polaris.gepa_integration import PolarisGEPAAdapter
     from polaris.vendored.gepa import optimize
 
+    gepa_run_dir = out_dir / "gepa_run"
+    stop_file = gepa_run_dir / "gepa.stop"
     adapter = PolarisGEPAAdapter(
         sampler=sampler,
         scorer=scorer,
@@ -191,13 +193,22 @@ def _run_live_gepa(
         adapter=adapter,
         reflection_lm=reflection_lm,
         max_metric_calls=max_metric_calls,
-        run_dir=str(out_dir / "gepa_run"),
+        run_dir=str(gepa_run_dir),
         seed=seed,
         display_progress_bar=False,
+        cache_evaluation=True,
     )
+    if stop_file.exists():
+        _write_json(out_dir / "gepa_partial_result.json", result.to_dict())
+        raise RuntimeError(
+            "GEPA stopped before final archive materialization; "
+            f"checkpoint is saved at {gepa_run_dir / 'gepa_state.bin'}. "
+            f"Remove {stop_file} and rerun the same timestamp to resume."
+        )
     _write_json(out_dir / "gepa_result.json", result.to_dict())
     return _archive_from_gepa_candidates(result.candidates, archive_size), {
         "dry_run": False,
+        "complete": True,
         "max_metric_calls": max_metric_calls,
         "total_metric_calls": result.total_metric_calls,
         "num_candidates": len(result.candidates),

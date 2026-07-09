@@ -19,6 +19,7 @@ Useful overrides:
   DRY_RUN=1 bash scripts/run_experiment.sh l40
   bash scripts/run_experiment.sh --doctor
   bash scripts/run_experiment.sh --status latest
+  bash scripts/run_experiment.sh --stop-gepa latest
   ml reset && ml python/3.12.1 && bash scripts/run_experiment.sh   # Sherlock
 
 Environment knobs:
@@ -75,6 +76,7 @@ Environment knobs:
 Options:
   --doctor                 Print cluster/package diagnostics, write cluster_probe.json, then exit.
   --status [TARGET]        Print latest run/cell checkpoint status, then exit.
+  --stop-gepa [TARGET]     Request graceful GEPA stop by writing gepa.stop, then exit.
   --gpu-profile PROFILE    auto, l40, a100, h100, or generic.
   --resume [TARGET]        Resume auto, latest, a UTC timestamp, a run id, or a run directory.
                            Default: auto, which resumes the latest incomplete matching run.
@@ -91,6 +93,8 @@ FRESH_RUN=0
 DOCTOR_ONLY=0
 STATUS_ONLY=0
 STATUS_TARGET=""
+STOP_GEPA_ONLY=0
+STOP_GEPA_TARGET=""
 HEARTBEAT_ARG="${PROICL_CELL_HEARTBEAT_SECONDS:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -114,6 +118,21 @@ while [[ $# -gt 0 ]]; do
         shift 2
       else
         STATUS_TARGET="latest"
+        shift
+      fi
+      ;;
+    --stop-gepa=*)
+      STOP_GEPA_ONLY=1
+      STOP_GEPA_TARGET="${1#--stop-gepa=}"
+      shift
+      ;;
+    --stop-gepa|stop-gepa)
+      STOP_GEPA_ONLY=1
+      if [[ -n "${2:-}" && "${2:-}" != --* ]]; then
+        STOP_GEPA_TARGET="$2"
+        shift 2
+      else
+        STOP_GEPA_TARGET="latest"
         shift
       fi
       ;;
@@ -197,7 +216,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unexpected argument: $1" >&2
-      echo "Usage: bash scripts/run_experiment.sh [auto|l40|a100|h100|generic] [--doctor|--status|--fresh]" >&2
+      echo "Usage: bash scripts/run_experiment.sh [auto|l40|a100|h100|generic] [--doctor|--status|--stop-gepa|--fresh]" >&2
       exit 2
       ;;
   esac
@@ -1230,7 +1249,7 @@ export PROICL_SKIP_BINARY_PREFLIGHT="$SKIP_BINARY_PREFLIGHT"
 export PROICL_SKIP_INSTALL="$SKIP_INSTALL"
 export PROICL_VENV="$VENV"
 
-if [[ "$STATUS_ONLY" != "1" ]]; then
+if [[ "$STATUS_ONLY" != "1" && "$STOP_GEPA_ONLY" != "1" ]]; then
   print_launch_summary
 fi
 if [[ "$DRY_RUN" != "1" ]]; then
@@ -1581,6 +1600,48 @@ def artifact_status(path: Path) -> dict:
     }
 
 
+def gepa_checkpoint_status(full_root: Path, current: dict) -> dict:
+    archive_dir = Path(current["archive_dir"]) if current.get("archive_dir") else None
+    if archive_dir is None or not archive_dir.exists():
+        candidates = sorted(full_root.glob("archives/*/gepa_run"))
+        if candidates:
+            archive_dir = candidates[-1].parent
+    if archive_dir is None:
+        return {}
+    run_dir = archive_dir / "gepa_run"
+    adapter_dir = archive_dir / "gepa_adapter"
+    state_path = run_dir / "gepa_state.bin"
+    candidates_path = run_dir / "candidates.json"
+    run_log_path = run_dir / "run_log.json"
+    manifest = load_json(archive_dir / "archive_build_manifest.json")
+    adapter_state = load_json(adapter_dir / "adapter_state.json")
+    try:
+        candidates_count = len(json.loads(candidates_path.read_text(encoding="utf-8")))
+    except Exception:
+        candidates_count = None
+    try:
+        run_log_count = len(json.loads(run_log_path.read_text(encoding="utf-8")))
+    except Exception:
+        run_log_count = None
+    try:
+        state_bytes = state_path.stat().st_size
+    except OSError:
+        state_bytes = 0
+    return {
+        "archive_dir": str(archive_dir),
+        "run_dir": str(run_dir),
+        "state_exists": state_path.exists(),
+        "state_bytes": state_bytes,
+        "stop_file_exists": (run_dir / "gepa.stop").exists(),
+        "candidates_count": candidates_count,
+        "run_log_count": run_log_count,
+        "adapter_completed_evaluations": adapter_state.get("completed_evaluations"),
+        "manifest_complete": manifest.get("gepa", {}).get("complete"),
+        "manifest_total_metric_calls": manifest.get("gepa", {}).get("total_metric_calls"),
+        "manifest_max_metric_calls": manifest.get("gepa", {}).get("max_metric_calls"),
+    }
+
+
 run_dir = resolve_run()
 if run_dir is None:
     print(f"No ProICL runs found for target={target!r} under {root}")
@@ -1665,6 +1726,8 @@ for row in events:
         "gepa_archive_failed",
         "gepa_archive_reuse",
         "gepa_archive_skipped",
+        "gepa_archive_stop_requested",
+        "gepa_stop_file_cleared",
     }:
         continue
     gepa_state["last_event"] = event
@@ -1678,6 +1741,9 @@ for row in events:
             "stdout_log",
             "stderr_log",
             "elapsed_seconds",
+            "gepa_state",
+            "stop_file",
+            "stop_requested",
         ):
             if field in row:
                 gepa_state[field] = row[field]
@@ -1695,6 +1761,13 @@ for row in events:
     elif event == "gepa_archive_skipped":
         gepa_state["status"] = "skipped"
         gepa_state["reason"] = row.get("reason")
+    elif event == "gepa_archive_stop_requested":
+        gepa_state["status"] = "stopping"
+        for field in ("gpu", "pid", "stop_file", "grace_seconds"):
+            if field in row:
+                gepa_state[field] = row[field]
+    elif event == "gepa_stop_file_cleared":
+        gepa_state["last_stop_file_cleared"] = row.get("stop_file")
 
 if gepa_state.get("status") == "active" and pid_alive(gepa_state.get("pid")) == "no":
     gepa_state["status"] = "stale"
@@ -1706,6 +1779,7 @@ elif not gepa_state.get("stderr_log"):
     gepa_logs = sorted((full / "logs").glob("build_gepa_k*.stderr.log"), key=lambda path: path.stat().st_mtime)
     if gepa_logs:
         gepa_state["stderr_log"] = str(gepa_logs[-1])
+gepa_checkpoint = gepa_checkpoint_status(full, gepa_state) if gepa_state else {}
 
 
 print(f"ProICL status: {run_dir}")
@@ -1740,9 +1814,24 @@ if gepa_state:
         f"pid={gepa_state.get('pid', '?')} alive={pid_alive(gepa_state.get('pid'))} "
         f"elapsed={gepa_state.get('elapsed_seconds', '?')}s "
         f"heartbeat_age={age_text(gepa_state.get('last_ts'))} "
+        f"stop_requested={gepa_state.get('stop_requested', '?')} "
         f"stderr_bytes={stderr_bytes} stderr_age={stderr_age_text} "
         f"log={stderr_log or 'unknown'}"
     )
+    if gepa_checkpoint:
+        print(
+            "  gepa_checkpoint="
+            f"state={gepa_checkpoint.get('state_exists')} "
+            f"state_bytes={gepa_checkpoint.get('state_bytes')} "
+            f"stop_file={gepa_checkpoint.get('stop_file_exists')} "
+            f"candidates={gepa_checkpoint.get('candidates_count')} "
+            f"run_log_rows={gepa_checkpoint.get('run_log_count')} "
+            f"adapter_evals={gepa_checkpoint.get('adapter_completed_evaluations')} "
+            f"metric_calls={gepa_checkpoint.get('manifest_total_metric_calls')}/"
+            f"{gepa_checkpoint.get('manifest_max_metric_calls')} "
+            f"manifest_complete={gepa_checkpoint.get('manifest_complete')} "
+            f"run_dir={gepa_checkpoint.get('run_dir')}"
+        )
 if active_states:
     print("  active:")
     for state in sorted(active_states, key=lambda item: (item["track"], item["condition"], item["shard"])):
@@ -1796,6 +1885,66 @@ if gpu_proc and gpu_proc.returncode == 0 and gpu_proc.stdout.strip():
         print(f"    {line.strip()}")
 PY
 }
+
+stop_gepa_checkpoint() {
+  local target="${1:-latest}"
+  "$PY" - "$RUN_ROOT" "$target" <<'PY'
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+root = Path(sys.argv[1])
+target = sys.argv[2] or "latest"
+stamp_re = re.compile(r"(\d{8}T\d{6}Z)")
+
+
+def stamp_from(value: str) -> str | None:
+    match = stamp_re.search(value)
+    return match.group(1) if match else None
+
+
+def resolve_run() -> Path | None:
+    path = Path(target)
+    if path.exists():
+        return path.parent if path.name == "full" else path
+    if target not in {"", "auto", "latest"}:
+        stamp = stamp_from(target)
+        if stamp and root.exists():
+            matches = sorted(root.glob(f"proicl_*{stamp}*"))
+            if matches:
+                return matches[-1]
+        candidate = root / target
+        if candidate.exists():
+            return candidate.parent if candidate.name == "full" else candidate
+        return None
+    if not root.exists():
+        return None
+    candidates = [path for path in root.glob("proicl_*") if path.is_dir()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item.stat().st_mtime)
+
+
+run_dir = resolve_run()
+if run_dir is None:
+    raise SystemExit(f"No ProICL run found for target={target!r} under {root}")
+full = run_dir / "full" if (run_dir / "full").exists() else run_dir
+gepa_runs = sorted(full.glob("archives/*/gepa_run"))
+if not gepa_runs:
+    raise SystemExit(f"No GEPA run directory found under {full / 'archives'}")
+now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+for gepa_run in gepa_runs:
+    stop_file = gepa_run / "gepa.stop"
+    stop_file.write_text(f"manual graceful stop requested at {now}\n", encoding="utf-8")
+    print(f"requested_gepa_stop={stop_file}")
+PY
+}
+
+if [[ "$STOP_GEPA_ONLY" == "1" ]]; then
+  stop_gepa_checkpoint "${STOP_GEPA_TARGET:-latest}"
+  exit 0
+fi
 
 if [[ "$STATUS_ONLY" == "1" ]]; then
   print_run_status "${STATUS_TARGET:-latest}"

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -48,6 +49,33 @@ DEFAULT_SIGNAL_CONDITIONS: tuple[str, ...] = (
     "gepa_mcmc_memory",
     "prorl_v2_greedy",
 )
+
+_TERMINATION_REQUESTED = False
+_ACTIVE_GEPA_STOP_PATH: Path | None = None
+_ACTIVE_GEPA_PROC: subprocess.Popen | None = None
+
+
+def _touch_gepa_stop_file(reason: str) -> None:
+    if _ACTIVE_GEPA_STOP_PATH is None:
+        return
+    _ACTIVE_GEPA_STOP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _ACTIVE_GEPA_STOP_PATH.write_text(reason + "\n", encoding="utf-8")
+
+
+def _handle_stop_signal(signum: int, _frame: Any) -> None:
+    global _TERMINATION_REQUESTED
+    _TERMINATION_REQUESTED = True
+    reason = f"signal {signum} requested graceful GEPA stop at {time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+    _touch_gepa_stop_file(reason)
+    print(f"[ProICL] graceful stop requested: {reason}", flush=True)
+
+
+def _install_signal_handlers() -> None:
+    for sig_name in ("SIGUSR1", "SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        signal.signal(sig, _handle_stop_signal)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -325,9 +353,17 @@ def _archive_is_live(
         return False
     if payload.get("dev_split") != list(dev_split):
         return False
-    if int(payload.get("gepa", {}).get("max_metric_calls", -1)) != int(max_metric_calls):
+    gepa_payload = payload.get("gepa", {})
+    if int(gepa_payload.get("max_metric_calls", -1)) != int(max_metric_calls):
         return False
-    if payload.get("gepa", {}).get("dry_run", True):
+    if gepa_payload.get("dry_run", True):
+        return False
+    if gepa_payload.get("complete") is False:
+        return False
+    if (
+        "complete" not in gepa_payload
+        and int(gepa_payload.get("total_metric_calls", 0)) < int(max_metric_calls)
+    ):
         return False
     expected_provider = "local_hf" if reflection_provider == "local-hf" else reflection_provider
     reflection = payload.get("reflection", {})
@@ -521,12 +557,21 @@ def _start_gepa_archive(
 
         append_event(events, "gepa_archive_reuse", archive_dir=str(out))
         return None
+    gepa_run_dir = out / "gepa_run"
+    gepa_state_path = gepa_run_dir / "gepa_state.bin"
+    gepa_stop_path = gepa_run_dir / "gepa.stop"
+    if gepa_stop_path.exists():
+        gepa_stop_path.unlink()
+        from polaris.proicl.launcher import append_event
+
+        append_event(events, "gepa_stop_file_cleared", stop_file=str(gepa_stop_path))
+    resume_checkpoint = gepa_state_path.exists()
     log_dir = root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / f"build_gepa_k{archive_size}.stdout.json"
     stderr_path = log_dir / f"build_gepa_k{archive_size}.stderr.log"
-    stdout = stdout_path.open("w", encoding="utf-8")
-    stderr = stderr_path.open("w", encoding="utf-8")
+    stdout = stdout_path.open("a", encoding="utf-8")
+    stderr = stderr_path.open("a", encoding="utf-8")
     cmd = _gepa_archive_command(
         args=args,
         out=out,
@@ -546,6 +591,9 @@ def _start_gepa_archive(
     proc = subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, stdout=stdout, stderr=stderr)
     stdout.close()
     stderr.close()
+    global _ACTIVE_GEPA_PROC, _ACTIVE_GEPA_STOP_PATH
+    _ACTIVE_GEPA_PROC = proc
+    _ACTIVE_GEPA_STOP_PATH = gepa_stop_path
     from polaris.proicl.launcher import append_event
 
     append_event(
@@ -554,6 +602,9 @@ def _start_gepa_archive(
         gpu=cuda_visible_devices,
         pid=getattr(proc, "pid", None),
         archive_dir=str(out),
+        resume_checkpoint=resume_checkpoint,
+        gepa_state=str(gepa_state_path),
+        stop_file=str(gepa_stop_path),
         stdout_log=str(stdout_path),
         stderr_log=str(stderr_path),
     )
@@ -567,35 +618,65 @@ def _wait_for_gepa_archive(
     gpu: str,
     heartbeat_seconds: int = 60,
 ) -> int:
+    global _ACTIVE_GEPA_PROC, _ACTIVE_GEPA_STOP_PATH
     if proc is None:
         return 0
     started = time.monotonic()
     next_heartbeat = started
-    while True:
-        rc = proc.poll()
-        elapsed = int(time.monotonic() - started)
-        if rc is not None:
-            print(
-                f"[ProICL] GEPA archive build finished rc={rc} elapsed={elapsed}s gpu={gpu}",
-                flush=True,
-            )
-            return int(rc)
-        now = time.monotonic()
-        if now >= next_heartbeat:
-            append_payload = {
-                "gpu": gpu,
-                "pid": getattr(proc, "pid", None),
-                "elapsed_seconds": elapsed,
-            }
-            from polaris.proicl.launcher import append_event
+    stop_started_at: float | None = None
+    stop_grace_seconds = int(os.environ.get("PROICL_GEPA_STOP_GRACE_SECONDS", "300"))
+    try:
+        while True:
+            rc = proc.poll()
+            elapsed = int(time.monotonic() - started)
+            if rc is not None:
+                print(
+                    f"[ProICL] GEPA archive build finished rc={rc} elapsed={elapsed}s gpu={gpu}",
+                    flush=True,
+                )
+                return int(rc)
+            now = time.monotonic()
+            if _TERMINATION_REQUESTED:
+                if stop_started_at is None:
+                    stop_started_at = now
+                    _touch_gepa_stop_file("parent requested graceful GEPA checkpoint stop")
+                    from polaris.proicl.launcher import append_event
 
-            append_event(events, "gepa_archive_heartbeat", **append_payload)
-            print(
-                f"[ProICL] GEPA archive build still running elapsed={elapsed}s gpu={gpu}",
-                flush=True,
-            )
-            next_heartbeat = now + heartbeat_seconds
-        time.sleep(min(5, heartbeat_seconds))
+                    append_event(
+                        events,
+                        "gepa_archive_stop_requested",
+                        gpu=gpu,
+                        pid=getattr(proc, "pid", None),
+                        grace_seconds=stop_grace_seconds,
+                    )
+                elif now - stop_started_at > stop_grace_seconds:
+                    print(
+                        "[ProICL] GEPA graceful stop grace period expired; terminating child",
+                        flush=True,
+                    )
+                    proc.terminate()
+                    stop_started_at = now + 10**9
+            if now >= next_heartbeat:
+                append_payload = {
+                    "gpu": gpu,
+                    "pid": getattr(proc, "pid", None),
+                    "elapsed_seconds": elapsed,
+                }
+                if _ACTIVE_GEPA_STOP_PATH is not None:
+                    append_payload["stop_file"] = str(_ACTIVE_GEPA_STOP_PATH)
+                    append_payload["stop_requested"] = _ACTIVE_GEPA_STOP_PATH.exists()
+                from polaris.proicl.launcher import append_event
+
+                append_event(events, "gepa_archive_heartbeat", **append_payload)
+                print(
+                    f"[ProICL] GEPA archive build still running elapsed={elapsed}s gpu={gpu}",
+                    flush=True,
+                )
+                next_heartbeat = now + heartbeat_seconds
+            time.sleep(min(5, heartbeat_seconds))
+    finally:
+        _ACTIVE_GEPA_PROC = None
+        _ACTIVE_GEPA_STOP_PATH = None
 
 
 def _run_cells_for_root(
@@ -742,6 +823,7 @@ def _partition_cells(cells: list[Any], *, stride: int, offset: int) -> list[Any]
 
 def main() -> None:
     args = _parse_args()
+    _install_signal_handlers()
     args.mcmc_block_num = _resolve_power_block_num(args)
     if args.power_sampler == "sps" and args.backend != "vllm":
         raise SystemExit("--power-sampler sps currently requires --backend vllm")

@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -146,11 +148,31 @@ def _cmd_write_direct_archives(args: argparse.Namespace) -> None:
     print(json.dumps({"archives": written}, sort_keys=True))
 
 
+def _install_gepa_archive_stop_handlers(out_dir: Path) -> None:
+    stop_file = out_dir / "gepa_run" / "gepa.stop"
+
+    def _handle(signum: int, _frame: object) -> None:
+        stop_file.parent.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        stop_file.write_text(
+            f"signal {signum} requested graceful GEPA stop at {ts}\n",
+            encoding="utf-8",
+        )
+        print(f"[ProICL] requested GEPA checkpoint stop: {stop_file}", file=sys.stderr, flush=True)
+
+    for sig_name in ("SIGUSR1", "SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            signal.signal(sig, _handle)
+
+
 def _cmd_build_archive(args: argparse.Namespace) -> None:
     if not args.dry_run and not args.live_gepa:
         raise ValueError("live GEPA archive construction requires --live-gepa")
     if not args.dry_run and args.reflection_provider == "none":
         raise ValueError("live GEPA requires --reflection-provider xai or local-hf")
+    if not args.dry_run:
+        _install_gepa_archive_stop_handlers(args.out)
 
     sampler = None
     scorer = None
